@@ -74,10 +74,34 @@ def submission(m, root, date=DATE, commit=None, prev=None):
 
 # ── 스냅샷 모습 만들기 ────────────────────────────────────────────────────
 
-def view(snaps, tmp, m, edit=None):
+def collapse(base):
+    """판이 여럿이면 최신 유효 판 하나만 v1 로 남긴다 — 사례들이 「v1 하나뿐인 날」에서 출발하게 하려는 것."""
+    idx_p = os.path.join(base, 'index.json')
+    idx = json.load(open(idx_p, encoding='utf-8'))
+    invalid = {i for x in idx['versions'] for i in x.get('invalidates') or []}
+    keep = max(x['v'] for x in idx['versions'] if x['v'] not in invalid)
+    if len(idx['versions']) == 1:
+        return
+    for x in idx['versions']:
+        if x['v'] != keep:
+            shutil.rmtree(os.path.join(base, 'v%d' % x['v']))
+    if keep != 1:
+        os.rename(os.path.join(base, 'v%d' % keep), os.path.join(base, 'v1'))
+    ent = dict(next(x for x in idx['versions'] if x['v'] == keep), v=1, kind='initial', invalidates=[])
+    idx['versions'] = [ent]
+    open(idx_p, 'w', encoding='utf-8').write(json.dumps(idx, ensure_ascii=False, indent=1))
+    man_p = os.path.join(base, 'v1', 'manifest.json')
+    man = json.load(open(man_p, encoding='utf-8'))
+    man.update(version=1, kind='initial', invalidates=[])
+    open(man_p, 'w', encoding='utf-8').write(json.dumps(man, ensure_ascii=False, indent=1, sort_keys=True))
+    reseal(base)
+
+
+def view(snaps, tmp, m, edit=None, name='snap'):
     """snapshots/<m>/<DATE> 를 복사하고 edit(dir) 로 바꾼다. edit 는 수집기가 했을 법한 일만 한다."""
-    root = os.path.join(tmp, 'snap')
+    root = os.path.join(tmp, name)
     shutil.copytree(os.path.join(snaps, m, DATE), os.path.join(root, m, DATE))
+    collapse(os.path.join(root, m, DATE))
     if os.path.isdir(os.path.join(snaps, m, PREV)):
         shutil.copytree(os.path.join(snaps, m, PREV), os.path.join(root, m, PREV))
     if edit:
@@ -388,7 +412,8 @@ def _run_case(arg):
         sub = dict(sub, routine_state=dict(sub['routine_state']))
         if c.get('tamper'):
             path, heading = c['tamper']
-            good = open(os.path.join(snaps, m, DATE, 'v1', 'files', path), 'rb').read()
+            lv = max(x['v'] for x in json.load(open(os.path.join(snaps, m, DATE, 'index.json'), encoding='utf-8'))['versions'])
+            good = open(os.path.join(snaps, m, DATE, 'v%d' % lv, 'files', path), 'rb').read()
             post, bad, detail = paired_tamper(post0, good, heading)
             if c.get('keep_post'):
                 post = post0
@@ -415,7 +440,7 @@ def _run_case(arg):
         code = code_variant(tmp, c['code']) if c.get('code') else J.CODE
         prev, published = None, False
         if c.get('rejudge'):                         # 먼저 깨끗한 상태에서 승인받아 실린 것으로 만든다
-            first = J.judge(m, DATE, post, sub, os.path.join(snaps), os.path.join(tmp, 'w0'), SUB[m]['cycle'], snap_ref=snap_ref)
+            first = J.judge(m, DATE, post, sub, view(snaps, tmp, m, None, name='snap0'), os.path.join(tmp, 'w0'), SUB[m]['cycle'], snap_ref=snap_ref)
             assert first['decision'] == 'publish', first['reasons']
             prev, published = J.ledger_entry(first), True
         root = view(snaps, tmp, m, snap_edit)
@@ -472,6 +497,7 @@ def real_absent(arg):
             if d <= date:
                 shutil.copytree(os.path.join(snaps, m, d), os.path.join(root, m, d))
         base = os.path.join(root, m, date)
+        collapse(base)
         if not os.path.isfile(os.path.join(base, 'v1', 'files', path)):
             return {'market': m, 'date': date, 'removed': path, 'decision': 'n/a', 'why': '그날 스냅샷에 원래 없음', 'hostile_executed': 0}
         os.remove(os.path.join(base, 'v1', 'files', path))
@@ -518,7 +544,8 @@ def main():
         if not a.only:
             jobs = []
             for m in ('us', 'kr'):
-                man = json.load(open(os.path.join(snaps, m, DATE, 'v1', 'manifest.json'), encoding='utf-8'))
+                idx = json.load(open(os.path.join(snaps, m, DATE, 'index.json'), encoding='utf-8'))
+                man = json.load(open(os.path.join(snaps, m, DATE, 'v%d' % max(x['v'] for x in idx['versions']), 'manifest.json'), encoding='utf-8'))
                 paths = [f['path'] for f in man['files']]
                 if m == 'kr':                        # 지난 뉴스·텔레그램·주간 파일은 묶음마다 하나만
                     seen, keep = set(), []

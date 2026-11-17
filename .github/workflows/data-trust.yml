@@ -20,7 +20,8 @@ jobs:
             7e18f8bc2bdc20d736608414e29b2e07efc42833 3ab3e3f617edc074d63ddc335722506fffd6a28b 68fdf456e1d9574d61f98d4f594f38dfa18bef98 \
             4f51fd9bce246793d8e93688e73ebc6abb8dbce5 8bc6e2543befd876881f2294e00abd58ee89c82d c93ea278aac51ce86be0d6d2a7599eeb65f93670 \
             61bd4b8c4f1834af2272e1968baecb33ca8f5167 252d765b5ec732247bbb9b6834e95ed494f6e300 bba3fc0ebc0c895e0197694cc74d7799a1e0e96f \
-            18feaabbbe96bb2f5b51635bc1990bacd75a9b58 73f2d8225a52ab146a04e4578cc53ffaabe95f02
+            18feaabbbe96bb2f5b51635bc1990bacd75a9b58 73f2d8225a52ab146a04e4578cc53ffaabe95f02 \
+            55edf2f15496643eefffd4573c5c17b159a96812 75ac3b2525fcb526bf9bf3e7f2e27d021f80593f 7d9fcdde1930de66f6a7b85a45bbd08f1588ca0c
       - name: Fetch the protected data repo (read-only, no credentials)
         run: |
           git clone -q --depth 1 https://github.com/fdo2a/gate-lab-data "$RUNNER_TEMP/data"
@@ -32,9 +33,13 @@ jobs:
         run: |
           python3 --version
           python3 dt/cases.py --op-git "$RUNNER_TEMP/op.git" --snapshots "$RUNNER_TEMP/data/snapshots" --out "$RUNNER_TEMP/out" --snap-ref "$DATA_SHA" --jobs 4
+      - name: Judgment evidence cases (recompute judgment numbers from the protected price history)
+        if: always()
+        run: |
+          python3 dt/ev_cases.py --op-git "$RUNNER_TEMP/op.git" --snapshots "$RUNNER_TEMP/data/snapshots" --out "$RUNNER_TEMP/out"
       - name: Summary
         if: always()
-        run: cat "$RUNNER_TEMP/out/matrix.md" >> "$GITHUB_STEP_SUMMARY" || true
+        run: cat "$RUNNER_TEMP/out/matrix.md" "$RUNNER_TEMP/out/evidence_matrix.md" >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -42,3 +47,5 @@ jobs:
           path: |
             ${{ runner.temp }}/out/matrix.json
             ${{ runner.temp }}/out/matrix.md
+            ${{ runner.temp }}/out/evidence_matrix.json
+            ${{ runner.temp }}/out/evidence_matrix.md
