@@ -318,7 +318,9 @@ def run_checks(code, market, post, date, cycle, work, policy, post_text, timeout
                 res['reason'] = '검사 프로그램이 없다'
             else:
                 try:
-                    p = subprocess.run([sys.executable, launcher, code, foreign, script, *argv[1:]], capture_output=True, text=True,
+                    # -I: 환경 변수·사용자 폴더·현재 폴더를 import 경로에서 뺀다. -S: site(시스템·사용자 sitecustomize)를 불러오지 않는다.
+                    # 실행 틀이 첫 경로를 검사기 폴더로 직접 잡으므로 -I 로도 검사기의 import 는 그대로 된다.
+                    p = subprocess.run([sys.executable, '-I', '-S', launcher, code, foreign, script, *argv[1:]], capture_output=True, text=True,
                                        cwd=ctx['repo'], env=env, timeout=timeout)
                     res['exit'] = p.returncode
                     res['status'] = R._classify(spec, p.returncode, p.stdout, p.stderr, ctx, res)
