@@ -25,6 +25,9 @@ jobs:
           echo "judge job env: no deploy credential"
       - name: Judge
         run: python3 gate.py judge src prev out
+      - name: Prove the source repo's own code was not executed
+        run: |
+          test ! -e /tmp/pwned && echo "untrusted code not executed"
       - uses: actions/upload-artifact@v4
         with:
           name: site
