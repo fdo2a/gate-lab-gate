@@ -126,9 +126,12 @@ def cmd_judge(src, prev, out):
             continue
         if cls == 'daily':
             daily_texts[rel] = text_of(full)
+            # 이미 실린 바이트라도 매번 다시 판정한다 — 예전에 통과시킨 것이 지금 기준으로도 통과하는지.
             same = os.path.isfile(os.path.join(prev, rel)) and sha(os.path.join(prev, rel)) == sha(full)
-            why, state = (None, 'unchanged') if same else judge_daily(rel, src, policy)
-            if why:
+            why, state = judge_daily(rel, src, policy)
+            if why and same:
+                verdict[rel] = ['withdraw', why]          # 실려 있는 바로 그 판이 떨어졌다 → 내린다
+            elif why:
                 verdict[rel] = ['hold', why]
                 keep_prev(rel)
             else:
