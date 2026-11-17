@@ -1,0 +1,40 @@
+name: data trust path (lab)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  judge:
+    # 비밀값 없음. 루틴이 낸 것(운영 저장소 발행 커밋이 대역)은 자료로만 받고, 검사 자료는 보호된 자료 저장소에서만 받는다.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch the submission stand-in as bare git data (no checkout)
+        run: |
+          git init -q --bare "$RUNNER_TEMP/op.git"
+          git --git-dir "$RUNNER_TEMP/op.git" fetch -q --depth 1 https://github.com/fdo2a/fdo2a.github.io \
+            3378e19652bbd5fdfef8281d4b33ad7fe18a4cb5 1b2e0050024159ab55b828d57d19e8c9539a2eab e9ef1a8394b4ae95dd9a7e663f22ac38b68096ff
+      - name: Fetch the protected data repo (read-only, no credentials)
+        run: |
+          git clone -q --depth 1 https://github.com/fdo2a/gate-lab-data "$RUNNER_TEMP/data"
+          echo "DATA_SHA=$(git -C "$RUNNER_TEMP/data" rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: No credentials in this job
+        run: |
+          if env | grep -i -E 'DEPLOY|SSH_KEY|SITE_|DATA_DEPLOY' ; then exit 1; fi; echo "no deploy credential in env"
+      - name: Run the cases (real US and KR checkers from the pinned copy, hostile modules planted in every submission)
+        run: |
+          python3 --version
+          python3 dt/cases.py --op-git "$RUNNER_TEMP/op.git" --snapshots "$RUNNER_TEMP/data/snapshots" --out "$RUNNER_TEMP/out" --snap-ref "$DATA_SHA" --jobs 4
+      - name: Summary
+        if: always()
+        run: cat "$RUNNER_TEMP/out/matrix.md" >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: data-trust-matrix
+          path: |
+            ${{ runner.temp }}/out/matrix.json
+            ${{ runner.temp }}/out/matrix.md

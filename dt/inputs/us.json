@@ -1,0 +1,28 @@
+{
+ "_doc": "미국 일간: 스냅샷 파일마다 언제 꼭 있어야 하는지. need=always 는 늘 필수, need={...} 는 글이 그 내용을 실었을 때만 필수(글 바이트로 판단), need=none 은 없어도 되고 기록만. asof 는 내용 속 기준일 필드, fresh=fetched 는 내용에 날짜가 없어 수집 기록의 시각으로 본다.",
+ "post": "posts/{date}.html",
+ "files": [
+  {"path": "datadir/market_data.json", "need": "always", "asof": true},
+  {"path": "datadir/movers.json", "need": "always", "asof": true},
+  {"path": "datadir/calendar.json", "need": "always", "asof": true},
+  {"path": "datadir/macro_eval.json", "need": "always", "asof": true},
+  {"path": "datadir/macro_metrics.json", "need": "always", "asof": true},
+  {"path": "datadir/fund_board.json", "need": "always", "asof": true},
+  {"path": "datadir/telegram.json", "need": "always", "asof": true},
+  {"path": "datadir/fed/events.json", "need": "always", "asof": true},
+  {"path": "datadir/econ_indicators.json", "need": "always", "fresh": "fetched"},
+  {"path": "datadir/auctions.json", "asof": true,
+   "need": {"marker": "data-(?:auction(?:-day|-table|-row)?|demand)\\b", "heading": "국채\\s*입찰", "text": "응찰\\s*배율|응찰률|낙찰\\s*금리|딜러\\s*비중|bid-to-cover"}},
+  {"path": "datadir/liquidity/liquidity.json", "asof": true,
+   "need": {"marker": "data-liquidity\\b", "heading": "유동성\\s*·\\s*수급", "text": "H\\.4\\.1|분기\\s*차입\\s*계획|QRA"}},
+  {"path": "datadir/intraday.json", "fresh": "fetched", "need": {"text": "장중|개장가|장\\s*초반|오후\\s*들어"}},
+  {"path": "datadir/releases/index.json", "need": "none"},
+  {"path": "datadir/fund_board.html", "need": "none"},
+  {"path": "datadir/sector_performance.html", "need": "none"},
+  {"path": "datadir/yield_curve.png", "need": "none"}
+ ],
+ "routine_state": ["datadir/macro.json", "datadir/macro_next.json", "src/research/us/"],
+ "self_consistency_only": ["check_macro(체제 판단 부분)", "check_research"],
+ "skip_ok": {},
+ "extra_argv": {}
+}

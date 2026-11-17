@@ -1,0 +1,124 @@
+{
+ "_doc": "한국 일간. 규칙은 us.json 과 같다.",
+ "post": "kr/posts/{date}.html",
+ "files": [
+  {
+   "path": "datadir/kr_market_data.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/kr_session.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/kr_fund_view.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "tg/kr_telegram.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/kr_flows.json",
+   "need": "always",
+   "fresh": "fetched"
+  },
+  {
+   "path": "datadir/kr_top_value.json",
+   "need": "always",
+   "fresh": "fetched"
+  },
+  {
+   "path": "datadir/kr_econ.json",
+   "need": "always",
+   "fresh": "fetched"
+  },
+  {
+   "path": "datadir/kr_intraday.json",
+   "need": "always",
+   "fresh": "fetched"
+  },
+  {
+   "path": "datadir/kr_stance_eval.json",
+   "need": "always",
+   "fresh": "fetched"
+  },
+  {
+   "path": "datadir/kr_movers.json",
+   "asof": true,
+   "need": {
+    "marker": "data-mover\\b"
+   }
+  },
+  {
+   "path": "datadir/kr_technical.json",
+   "fresh": "fetched",
+   "need": {
+    "heading": "기술적\\s*분석"
+   }
+  },
+  {
+   "path": "datadir/kr_sector.html",
+   "fresh": "fetched",
+   "need": {
+    "heading": "업종\\s*·\\s*섹터"
+   }
+  },
+  {
+   "path": "datadir/kr_industry.json",
+   "fresh": "fetched",
+   "need": {
+    "heading": "업종\\s*·\\s*섹터"
+   }
+  },
+  {
+   "path": "datadir/kr_stock_moves.json",
+   "need": "none"
+  },
+  {
+   "path": "datadir/kr_index_etf.json",
+   "need": "none"
+  },
+  {
+   "path": "datadir/kr_flows_intraday.json",
+   "need": "none"
+  },
+  {
+   "path": "datadir/kr_fund_view.html",
+   "need": "none"
+  },
+  {
+   "path": "datadir/kr_charts_manifest.json",
+   "need": "none"
+  },
+  {
+   "path": "datadir/kr_theme.json",
+   "need": "none",
+   "_note": "원천이 죽어 9월부터 빈 목록 — 글이 쓰지 않는다"
+  },
+  {
+   "path": "datadir/kr_program.json",
+   "need": "none",
+   "_note": "원천 폐지(2026-09-17) — 글이 「싣지 않는다」고 밝힌다"
+  }
+ ],
+ "routine_state": [
+  "datadir/kr_stance.json",
+  "stance_next/kr_stance_next.json",
+  "src/research/kr/"
+ ],
+ "self_consistency_only": [
+  "check_kr_stance",
+  "check_research"
+ ],
+ "skip_ok": {
+  "check_movers": {
+   "unless_marker": "data-mover\\b"
+  }
+ },
+ "extra_argv": {}
+}
