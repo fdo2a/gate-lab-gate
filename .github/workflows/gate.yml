@@ -1,0 +1,63 @@
+name: gate (lab)
+on:
+  workflow_dispatch:
+concurrency:
+  group: gate
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  judge:
+    # 비밀값 없음. 원본 저장소는 자료로만 받는다 — 그 안의 코드는 실행하지 않는다.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch source (data only) and the currently published tree
+        run: |
+          git clone -q --depth 1 https://github.com/fdo2a/gate-lab-site src
+          git -C src rev-parse HEAD > src.sha
+          git clone -q --depth 1 --branch site https://github.com/fdo2a/gate-lab-site prev
+          rm -rf src/.git prev/.git
+      - name: Prove no deploy credential is present in this job
+        run: |
+          if env | grep -i -E 'DEPLOY|SSH_' ; then echo "credential leaked into judge job"; exit 1; fi
+          echo "judge job env: no deploy credential"
+      - name: Judge
+        run: python3 gate.py judge src prev out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: |
+            out
+            out.verdict.json
+            src.sha
+          include-hidden-files: true
+  publish:
+    # 배포 열쇠는 이 작업에만 있다. 여기서는 문지기 저장소의 코드만 실행한다.
+    needs: judge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+      - name: Seal (bytes equal what was judged)
+        run: python3 gate.py seal out
+      - name: Push to the protected branch with the gate's key
+        env:
+          DEPLOY_KEY: ${{ secrets.SITE_DEPLOY_KEY }}
+        run: |
+          install -m 600 /dev/null "$RUNNER_TEMP/key" && printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/key"
+          export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+          git clone -q --branch site git@github.com:fdo2a/gate-lab-site.git pub
+          find pub -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R out/. pub/
+          cd pub
+          git config user.name "gate-lab" && git config user.email "gate-lab@example.invalid"
+          git add -A
+          if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
+          git commit -qm "publish: source $(cat ../src.sha | cut -c1-8)"
+          git push -q origin site
+          rm -f "$RUNNER_TEMP/key"

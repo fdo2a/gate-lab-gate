@@ -1,0 +1,2 @@
+{"gated": "^posts/\\d{4}-\\d{2}-\\d{2}\\.html$", "gated_dir": "posts/", "required": ["check_post"],
+ "strip": [".github", "scripts", "verification"]}
