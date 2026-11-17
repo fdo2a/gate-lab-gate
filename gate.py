@@ -24,12 +24,15 @@ def shingles(text, n=5):
 def rerun(rel, src, policy):
     for name in policy['required']:
         try:
+            data_dir = os.path.join(HERE, 'trusted_data') if policy.get('data_source') == 'locked' else os.path.join(src, 'data')
             r = subprocess.run([sys.executable, '-I', '-S', os.path.join(HERE, 'trusted', name + '.py'),
-                                os.path.join(src, rel)], capture_output=True, text=True, timeout=60, cwd=HERE)
+                                os.path.join(src, rel), data_dir], capture_output=True, text=True, timeout=60, cwd=HERE)
         except Exception:  # noqa: BLE001
             return 'tool_error:' + name
         if r.returncode == 1 and r.stdout.startswith('fail'):
             return 'gate_failed:' + name
+        if r.returncode == 3:
+            return 'input_missing:' + name
         if r.returncode != 0:
             return 'tool_error:' + name
     return None
