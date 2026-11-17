@@ -57,12 +57,17 @@ jobs:
           install -m 600 /dev/null "$RUNNER_TEMP/key" && printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/key"
           export GIT_SSH_COMMAND="ssh -i $RUNNER_TEMP/key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
           git clone -q --branch site git@github.com:fdo2a/gate-lab-site.git pub
+          # 오래된 실행이 최신 사이트를 덮지 못하게: 마지막으로 발행한 원본보다 새 원본일 때만
+          LAST=$(git -C pub log -1 --format=%s | sed -n 's/^publish: source \([0-9a-f]*\).*/\1/p')
+          git clone -q --bare https://github.com/fdo2a/gate-lab-site srcgit
+          LAST_FULL=$(git -C srcgit rev-parse --verify -q "$LAST^{commit}" || true)
+          python3 gate.py fresh srcgit "$(cat src.sha)" "$LAST_FULL"
           find pub -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           cp -R out/. pub/
           cd pub
           git config user.name "gate-lab" && git config user.email "gate-lab@example.invalid"
           git add -A
           if git diff --cached --quiet; then echo "nothing to publish"; exit 0; fi
-          git commit -qm "publish: source $(cat ../src.sha | cut -c1-8)"
+          git commit -qm "publish: source $(cat ../src.sha)"
           git push -q origin site
           rm -f "$RUNNER_TEMP/key"

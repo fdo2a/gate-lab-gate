@@ -1,2 +1,10 @@
-{"gated": "^posts/\\d{4}-\\d{2}-\\d{2}\\.html$", "gated_dir": "posts/", "required": ["check_post"],
- "strip": [".github", "scripts", "verification"]}
+{"required": ["check_post"],
+ "classes": [
+  {"name": "daily",  "pattern": "^posts/\\d{4}-\\d{2}-\\d{2}\\.html$"},
+  {"name": "news",   "pattern": "^news/\\d{4}-\\d{2}-\\d{2}\\.html$"},
+  {"name": "chrome", "pattern": "^(index\\.html)$"},
+  {"name": "list",   "pattern": "^(posts\\.json)$"}
+ ],
+ "daily_markers": ["data-daily", "<h1>"],
+ "dup_threshold": 0.5,
+ "reject_reasons": ["misread", "interpretive", "out_of_scope"]}
