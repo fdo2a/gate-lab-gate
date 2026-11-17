@@ -1,0 +1,282 @@
+"""Post shell — the part of a daily brief that is the same every day.
+
+Writers used to hand-write the whole document: head, SEO meta, JSON-LD,
+~6 KB of CSS, top bar. The orchestrator then hand-injected the nav block and the SEO
+meta a second time. Every day that cost output tokens and a long CSS spec in the
+writer prompt, and it produced defects no gate looked at — the 2026-09-23 US post
+carried description, canonical and og tags twice, and US CSS drifted across 125
+selectors in 20 posts. This module renders all of it from two writer inputs:
+
+    meta  {"title": SEO <title>, "summary": 1–2 sentence og/JSON-LD description}
+    body  the sections that go inside <div class="doc"> (headline card with the one <h1>)
+
+Everything else is derived: og:title from the date, meta description from the <h1>,
+canonical/og:url from market + date, CSS from `post_css/<market>.css`.
+
+Pure. CLI: scripts/render_post.py.
+
+Design: docs/superpowers/specs/2026-09-24-post-shell.md
+"""
+
+import html as _html
+import json
+import re
+from datetime import date as _date, timedelta
+from pathlib import Path
+
+from scripts.common import post_parts
+from scripts.common.analytics import SNIPPET as ANALYTICS
+
+CSS_DIR = Path(__file__).resolve().parent / 'post_css'
+MARKER = '<!-- post-shell-v1 -->'
+WEEKDAYS = '월화수목금토일'
+
+# Pretendard is the design font (AGENTS.md rule 1) but no reader has it installed; until
+# 2026-10-21 the stack only named it and document.fonts stayed empty. The dynamic subset fetches
+# only the unicode ranges a page uses and declares font-display: swap.
+FONT_LINK = ('<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>\n'
+             '<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9'
+             '/dist/web/variable/pretendardvariable-dynamic-subset.min.css">')
+
+MARKETS = {
+    'us': {
+        'brand': 'US Market Brief', 'site': 'https://fdo2a.github.io/', 'dir': 'posts',
+        'og': '미국 증시 모닝브리프', 'title_prefix': '미국 증시 마감 시황 — ',
+        # Published the next morning KST, after the US close.
+        'published_offset': 1,
+        'home': '미국 시장', 'span': ('일간', 'daily'), 'aside': None,
+    },
+    'kr': {
+        'brand': 'KR Market Brief', 'site': 'https://fdo2a.github.io/kr/', 'dir': 'kr/posts',
+        'og': '한국 증시 마감브리프', 'title_prefix': '코스피 마감 시황 — ',
+        'published_offset': 0,
+        'home': '한국 시장', 'span': ('일간', 'daily'), 'aside': ('미국 시장 →', '../../index.html'),
+    },
+    # 뉴스·산업 브리프(2026-09-26) — US 루틴이 브리프와 함께 쓰는 둘째 글. 오늘의 뉴스·메모리/DRAM·
+    # AI 인프라·MLCC 가 브리프에서 여기로 옮겨 왔다. 조판은 US 와 같다(`css` 키).
+    'news': {
+        'brand': 'US News & Industry', 'site': 'https://fdo2a.github.io/', 'dir': 'news',
+        'og': '미국 뉴스·산업 브리프', 'title_prefix': '미국 뉴스·산업 브리프 — ',
+        'published_offset': 1, 'css': 'us', 'topbar': 'us',
+        # 같은 날 브리프로 돌아가는 길. 브리프가 먼저 발행되므로 링크가 끊기지 않는다.
+        'home': '미국 시장', 'span': ('뉴스·산업', 'news'),
+        'aside': ('같은 날 시황 브리프 →', '../posts/{date}.html'),
+    },
+    # KR 뉴스(2026-11-05) — KR 루틴이 마감브리프 뒤에 쓰는 둘째 글. 「오늘의 뉴스」와 쟁점 분석이 브리프에서
+    # 여기로 옮겨 왔다. 조판은 KR 과 같다(`css` 키). 사용자 지시 「한국 레포트 칸에도 미국처럼 뉴스탭」.
+    'kr-news': {
+        'brand': 'KR News', 'site': 'https://fdo2a.github.io/kr/', 'dir': 'kr/news',
+        'og': '한국 시장 뉴스', 'title_prefix': '한국 시장 뉴스 — ',
+        'published_offset': 0, 'css': 'kr', 'topbar': 'kr',
+        'home': '한국 시장', 'span': ('뉴스', 'news'),
+        'aside': ('같은 날 마감브리프 →', '../posts/{date}.html'),
+    },
+}
+
+_FORBIDDEN = (('<!doctype', 'DOCTYPE'), ('<html', '<html>'), ('<head', '<head>'),
+              ('<body', '<body>'))
+_DOC_DIV = re.compile(r'<div\b[^>]*class=["\'][^"\']*\bdoc\b', re.I)
+_H1 = re.compile(r'<h1\b[^>]*>(.*?)</h1>', re.S | re.I)
+_STYLE = re.compile(r'<style\b[^>]*>(.*?)</style>', re.S | re.I)
+_RULE = re.compile(r'([^{}]+)\{(?:[^{}]|\{[^{}]*\})*\}')
+_TAG = re.compile(r'<[^>]+>')
+
+
+def escape(text):
+    return _html.escape(text, quote=True)
+
+
+def unescape(text):
+    return _html.unescape(text)
+
+
+def plain(fragment):
+    return re.sub(r'\s+', ' ', unescape(_TAG.sub('', fragment))).strip()
+
+
+def css(market):
+    name = MARKETS.get(market, {}).get('css', market)
+    return ((CSS_DIR / f'{name}.css').read_text(encoding='utf-8')
+            + (CSS_DIR / 'wayfinding.css').read_text(encoding='utf-8'))
+
+
+# Stylesheets earlier posts were published with. Gates that trust "what the shell renders"
+# (check_contested) must keep trusting posts still inside their correction window.
+LEGACY_CSS = {'us': ('legacy/us-2026-10-20.css', 'legacy/us-2026-10-21.css', 'legacy/us-2026-10-31.css', 'legacy/us-2026-11-04.css',
+              'legacy/us-2026-11-05.css'),
+              'kr': ('legacy/kr-2026-10-20.css', 'legacy/kr-2026-10-21.css', 'legacy/kr-2026-10-31.css', 'legacy/kr-2026-11-04.css',
+              'legacy/kr-2026-11-05.css')}
+
+
+def legacy_css(market):
+    name = MARKETS.get(market, {}).get('css', market)
+    return [(CSS_DIR / p).read_text(encoding='utf-8') for p in LEGACY_CSS.get(name, ())]
+
+
+# Post footer: previous / next post and, for US, the same day's news brief. The next post
+# and the news brief do not exist when a post is rendered, so the links are filled from the
+# archive index at read time and stay hidden if it cannot be read.
+_FOOT_JS = '''<script>(function(){
+var f=document.querySelector('nav.post-foot');if(!f)return;var key=f.getAttribute('data-key');
+function show(c,h){var a=f.querySelector('.'+c);if(a&&h){a.setAttribute('href',h);a.hidden=false;}}
+function get(u){return fetch(u,{cache:'no-cache'}).then(function(r){if(!r.ok)throw r;return r.json();});}
+function keyOf(p){return p&&(p.date||p.key);}
+get(f.getAttribute('data-index')).then(function(list){
+var keys=list.map(keyOf).filter(Boolean).sort();var i=keys.indexOf(key);if(i<0)return;
+if(i>0)show('pf-prev',keys[i-1]+'.html');if(i<keys.length-1)show('pf-next',keys[i+1]+'.html');
+}).catch(function(){});
+var news=f.getAttribute('data-news-index');
+if(news)get(news).then(function(list){
+if(list.some(function(p){return keyOf(p)===key;}))show('pf-news','../news/'+key+'.html');
+}).catch(function(){});
+var map=document.querySelector('nav.reading-map');if(!map)return;
+var links=[].slice.call(map.querySelectorAll('a[href^="#"]'));
+var secs=links.map(function(a){return document.getElementById(a.getAttribute('href').slice(1));});
+var cur=-1,queued=false;
+function update(){queued=false;
+if(map.scrollLeft+map.clientWidth<map.scrollWidth-2)map.setAttribute('data-more','');
+else map.removeAttribute('data-more');
+var y=map.getBoundingClientRect().bottom+32,at=-1;
+secs.forEach(function(s,i){if(s&&s.getBoundingClientRect().top<=y)at=i;});
+if(at===cur)return;cur=at;
+links.forEach(function(a,i){if(i===at)a.setAttribute('aria-current','true');else a.removeAttribute('aria-current');});
+if(at<0)return;var r=links[at].getBoundingClientRect(),m=map.getBoundingClientRect();
+if(r.left<m.left+16)map.scrollBy({left:r.left-m.left-16});else if(r.right>m.right-32)map.scrollBy({left:r.right-m.right+32});}
+function later(){if(!queued){queued=true;requestAnimationFrame(update);}}
+window.addEventListener('scroll',later,{passive:true});window.addEventListener('resize',later);
+map.addEventListener('scroll',later,{passive:true});update();
+})();</script>'''
+
+
+def crumbs(trail, aside=None):
+    """Where this page sits: market home › list. One row under the topbar on every generated
+    post. **No numbers** — the topbar already carries the date, and a date here would enter recap
+    evidence and widen the weekly figure allowlist (codex 2026-10-21)."""
+    sep = '<span class="crumbs-sep" aria-hidden="true">›</span>'
+    parts = [f'<a href="{escape(h)}">{escape(t)}</a>' if h else f'<span>{escape(t)}</span>'
+             for t, h in trail]
+    side = (f'<a class="crumbs-aside" href="{escape(aside[1])}">{escape(aside[0])}</a>'
+            if aside else '')
+    return f'<nav class="crumbs" aria-label="현재 위치">{sep.join(parts)}{side}</nav>'
+
+
+# Daily briefs that have a same-day news post, and the footer label for it. US and KR lay their
+# directories out the same way (posts/ beside news/), so the relative paths are shared.
+NEWS_LINK = {'us': '같은 날 뉴스·산업 →', 'kr': '같은 날 뉴스 →'}
+
+
+def footer(market, date):
+    index = '../news.json' if market in ('news', 'kr-news') else '../posts.json'
+    # Not `data-news`: news_gate reads any element carrying that attribute as an article.
+    news = ' data-news-index="../news.json"' if market in NEWS_LINK else ''
+    news_link = (f'\n  <a class="pf-news" hidden>{NEWS_LINK[market]}</a>' if market in NEWS_LINK else '')
+    return (f'<nav class="post-foot" aria-label="다른 글로 이동" data-index="{index}" '
+            f'data-key="{date}"{news}>\n'
+            '  <a class="pf-prev" hidden>‹ 이전 글</a>\n'
+            '  <a class="pf-next" hidden>다음 글 ›</a>'
+            f'{news_link}\n'
+            # Bare "#" scrolls to the top without an id — parsers match the topbar verbatim.
+            '  <a href="#">↑ 처음으로</a>\n'
+            '  <a href="../index.html">전체 보고서</a>\n'
+            f'</nav>\n{_FOOT_JS}')
+
+
+def _selectors(stylesheet):
+    out = set()
+    text = re.sub(r'/\*.*?\*/', '', stylesheet, flags=re.S)
+    for match in _RULE.finditer(text):
+        head = match.group(1).strip()
+        if head.startswith('@'):
+            inner = match.group(0)[match.group(0).index('{') + 1:-1]
+            out |= _selectors(inner)
+        else:
+            out |= {' '.join(s.split()) for s in head.split(',') if s.strip()}
+    return out
+
+
+def _long_date(day):
+    return f'{day.year}년 {day.month}월 {day.day}일 ({WEEKDAYS[day.weekday()]}요일)'
+
+
+def validate(market, date, meta, body):
+    """Everything wrong with the writer's inputs, as sentences. Empty means renderable."""
+    errors = []
+    if market not in MARKETS:
+        return [f'market 은 {"·".join(MARKETS)} 중 하나다 ({market!r})']
+    cfg = MARKETS[market]
+    try:
+        _date.fromisoformat(date)
+    except (TypeError, ValueError):
+        errors.append(f'date 는 YYYY-MM-DD 다 ({date!r})')
+    title = (meta or {}).get('title') or ''
+    if not (title.startswith(cfg['title_prefix']) and title.endswith(f' | {date}')
+            and len(title) > len(cfg['title_prefix']) + len(date) + 3):
+        errors.append(f'meta.title 은 「{cfg["title_prefix"]}[핵심구] | {date}」 형식이다 '
+                      f'({title!r})')
+    if not ((meta or {}).get('summary') or '').strip():
+        errors.append('meta.summary 가 비었다 — og:description·JSON-LD 설명이 된다')
+    low = body.lower()
+    for needle, name in _FORBIDDEN:
+        if needle in low:
+            errors.append(f'본문에 {name} 가 있다 — 셸이 만든다. 섹션만 쓴다')
+    if _DOC_DIV.search(body):
+        errors.append('본문에 <div class="doc"> 가 있다 — 셸이 감싼다')
+    n = len(_H1.findall(body))
+    if n != 1:
+        errors.append(f'<h1> 은 헤드라인 카드에 정확히 하나다 (지금 {n}개)')
+    base = _selectors(css(market))
+    for block in _STYLE.findall(body):
+        clash = sorted(_selectors(block) & base)
+        if clash:
+            errors.append('본문 <style> 이 템플릿 선택자를 다시 정의한다: '
+                          + ', '.join(clash[:6]) + ' — 조판은 템플릿 몫이다')
+    return errors
+
+
+def render(market, date, meta, body):
+    """The complete document. Call `validate` first; this does not re-check."""
+    cfg = MARKETS[market]
+    if post_parts.applies(market, date):
+        body = post_parts.mark(body, market)
+    day = _date.fromisoformat(date)
+    url = f'https://fdo2a.github.io/{cfg["dir"]}/{date}.html'
+    # 독자가 보는 날짜는 모두 거래일(키)이다 — 2026-10-04 사용자 지시로 한국 발행일 표시를 되돌렸다.
+    og_title = f'{cfg["og"]} — {_long_date(day)}'
+    h1 = plain(_H1.search(body).group(1))
+    description = f'{h1}. {date} {cfg["og"]}.'
+    title = meta['title'].strip()
+    summary = meta['summary'].strip()
+    published = (day + timedelta(days=cfg['published_offset'])).isoformat()
+    ld = {'@context': 'https://schema.org', '@type': 'NewsArticle', 'headline': og_title,
+          'description': summary, 'datePublished': published, 'dateModified': published,
+          'author': {'@type': 'Organization', 'name': cfg['brand'], 'url': cfg['site']},
+          'publisher': {'@type': 'Organization', 'name': cfg['brand'], 'url': cfg['site']},
+          'mainEntityOfPage': url, 'inLanguage': 'ko'}
+    # `</` inside a JSON string would close the <script> element early.
+    ld_text = json.dumps(ld, ensure_ascii=False).replace('</', '<\\/')
+    if cfg.get('topbar', market) == 'us':
+        topbar = (f'<span class="brand">{cfg["brand"]}</span> · {day.year}년 {day.month}월 '
+                  f'{day.day}일({WEEKDAYS[day.weekday()]}) 마감 기준')
+    else:
+        topbar = (f'<span class="brand">{cfg["brand"]}</span>'
+                  f'<span class="date">{_long_date(day)} 마감</span>')
+    label, span = cfg['span']
+    aside = cfg['aside'] and (cfg['aside'][0], cfg['aside'][1].replace('{date}', date))
+    nav = crumbs([(cfg['home'], '../index.html'), (label, f'../index.html?span={span}')], aside)
+    return (
+        '<!DOCTYPE html>\n<html lang="ko">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'<meta name="description" content="{escape(description)}">\n'
+        f'<link rel="canonical" href="{url}">\n'
+        '<meta property="og:type" content="article">\n'
+        f'<meta property="og:title" content="{escape(og_title)}">\n'
+        f'<meta property="og:url" content="{url}">\n'
+        f'<meta property="og:description" content="{escape(summary)}">\n'
+        f'<title>{escape(title)}</title>\n'
+        f'<script type="application/ld+json">\n{ld_text}\n</script>\n'
+        f'{MARKER}\n{FONT_LINK}\n<style>\n{css(market)}</style>\n{ANALYTICS}\n</head>\n'
+        # US·KR 일간은 PM 이 읽는 -다 문서다 — check_style 이 이 선언을 보고 데스크 검사를 건다.
+        f'<body data-register="da">\n<div class="topbar">{topbar}</div>\n{nav}\n'
+        f'<div class="doc">{body}</div>\n{footer(market, date)}\n</body>\n</html>\n'
+    )

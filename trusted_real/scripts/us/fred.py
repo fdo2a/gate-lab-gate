@@ -1,0 +1,469 @@
+"""FRED 전송 계층 — 공식 API 우선, 비공식 graph CSV 폴백.
+
+2026-09-05 이전까지 이 레포의 FRED 접근은 `fred.stlouisfed.org/graph/fredgraph.csv?id=…`
+하나였다. 키가 없어 그냥 되지만 그것은 **그래프 서비스의 출력**이지 문서화된 API 가
+아니다. Yahoo(2026-07-15)·BLS/DOL(2026-08-18)이 조용히 403 으로 돌아선 전례가 둘 있고,
+FRED 는 수익률·경제지표·금리 분해·해부 구성항목의 유일한 출처라 여기가 막히면 브리프의
+절반이 빈다. 사용자가 API 키를 발급받아 공식 엔드포인트로 옮긴다.
+
+**바꾸는 것은 파이프뿐이다.** `series()` 의 계약은 예전 `fred_series()` 그대로다 —
+오래된→최신 `(date, float)`, `.`·빈 값 제거, **전체 이력**. 구간을 자르지 않는 이유는
+`macro_metrics` 가 60포인트 모멘텀과 12포인트 YoY 를 이력에서 계산하기 때문이다.
+
+설계·검토 이력은 프로젝트 루트 `plan.md`(2026-09-05).
+"""
+import datetime as dt
+import json
+import os
+import re
+import ssl
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = 'https://api.stlouisfed.org/fred/series/observations'
+CSV = 'https://fred.stlouisfed.org/graph/fredgraph.csv'
+# 다음 발표가 언제인가. 그래프 서비스에는 이 표가 없어서 **폴백 경로로는 못 온다** —
+# 키가 없는 날은 일정이 빈다. 없는 것을 없다고 적는 쪽이 지난 일정을 오늘 것처럼
+# 인쇄하는 쪽보다 낫다.
+RELEASES_DATES = 'https://api.stlouisfed.org/fred/releases/dates'
+# 시리즈가 속한 릴리스(id·이름). 일정 행을 이름 대신 id 로 거르는 데 쓴다(us.upcoming).
+SERIES_RELEASE = 'https://api.stlouisfed.org/fred/series/release'
+# 한 릴리스의 발표일 목록(2026-11-08 A단계 — 해부 구성요소의 회차 D 를 고른다).
+RELEASE_DATES = 'https://api.stlouisfed.org/fred/release/dates'
+# 회차 조회의 실시간 창. D 에 시작하는 행을 찾는 것이라 D 가 창 안쪽이기만 하면 된다 —
+# 시작 경계(D−40)에 걸린 행의 realtime_start 는 최초 시작일이 아니다(codex 5회).
+VINTAGE_DAYS = 40
+# 한 번에 몇 건이나 오는가. 열흘 창이면 수십 건이라 넉넉하다 — 그래도 잘림은 센다.
+DATES_LIMIT = 1000
+
+# 응답이 잘렸는지 셀 수 있게 상한을 명시로 보낸다. FRED 기본값도 같은 수지만
+# 기본값은 약속이 아니다 — 계약이 기본값에 기대면 조용히 짧아진 이력을 받는다.
+LIMIT = 100000
+# 오름차순·현재 vintage·원계열·전 구간. 여섯 개 전부 지금의 기본값과 같고, 그래서
+# 명시하는 값이 있다: 기본값이 바뀌어도 우리 숫자는 안 바뀐다.
+PINS = (('file_type', 'json'), ('sort_order', 'asc'),
+        ('observation_start', '1776-07-04'), ('observation_end', '9999-12-31'),
+        ('units', 'lin'), ('output_type', '1'), ('limit', str(LIMIT)))
+
+_KEY_IN_URL = re.compile(r'(?i)(api_key=)[^&\s\'"]+')
+# 「키가 거부됐다」로 읽을 근거. 쿼리를 되풀이하는 점검 페이지도 `api_key` 를 담으므로
+# 문자열만으로는 모자라고, 상태 코드도 같이 본다(_as_error).
+_KEY_WORDS = re.compile(r'(?i)api[_ ]key')
+_AUTH_STATUS = (400, 401, 403)
+_TITLE = re.compile(rb'(?is)<title[^>]*>(.*?)</title>')
+TRANSIENT = (408, 425, 429, 500, 502, 503, 504)
+PREFLIGHT_SID = 'DGS10'
+
+
+def scrub(text, key=None):
+    """키를 마스킹한다. 로그·예외로 나가는 모든 문자열에 적용.
+
+    셋을 다 지운다 — 쿼리 패턴 · 생성자가 받은 키 · 환경변수. 어느 하나만으로는
+    구멍이 남는다(생성자 키가 환경변수와 다를 수 있고, 패턴만으로는 키가 본문에
+    맨몸으로 실려 온 경우를 놓친다). ECOS `scripts/kr/econ.py` 와 같은 규율.
+    """
+    s = _KEY_IN_URL.sub(r'\1***', str(text))
+    for k in (key, os.environ.get('FRED_API_KEY')):
+        if k:
+            s = s.replace(k, '***')
+    return s
+
+
+class FredError(Exception):
+    """살균된 메시지만 든다. 원본 HTTPError 는 이 경계를 넘지 않는다 —
+    `HTTPError.url` 에 키가 그대로 들어 있기 때문이다(실측 2026-09-05)."""
+
+    def __init__(self, message, status=None, auth=False, transient=False):
+        super().__init__(message)
+        self.status = status
+        self.auth = auth
+        self.transient = transient
+
+
+def _ssl_context():
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+class FredClient:
+    """한 실행에 하나. 전송을 예비검사로 **불변** 결정하고 그 뒤로는 안 바꾼다.
+
+    전역이 아니라 인스턴스에 상태를 두는 이유는 테스트·재진입 때문이다. 한 번
+    열화한 전역은 그 인터프리터가 끝날 때까지 열화한 채로 남는다.
+    """
+
+    def __init__(self, key=None, ssl_ctx=None, min_interval=0.35, timeout=25,
+                 opener=None, sleep=None, clock=None, transport=None, fallback=True):
+        self.key = (key if key is not None else os.environ.get('FRED_API_KEY')) or None
+        self._ssl = ssl_ctx
+        self._timeout = timeout
+        self._opener = opener
+        self._sleep = sleep or time.sleep
+        self._clock = clock or time.monotonic
+        self._min_interval = min_interval
+        # 폴백을 끄면 API 가 실패해도 CSV 로 안 내려간다. 진단(`--fred-check`)이
+        # 쓴다 — 켜져 있으면 API 클라이언트가 조용히 CSV 로 내려가 **CSV 끼리**
+        # 비교하고 「identical」을 인쇄한다(2026-09-05 실측으로 잡은 거짓 초록).
+        self.fallback = fallback
+        self._last = None
+        self._earliest = None
+        self.transport = transport
+        self.reason = None if transport else ('no_key' if not self.key else None)
+        self.error = None
+        if transport is None and not self.key:
+            self.transport = 'csv'
+        self._cache = {}
+        self.requests = 0
+        self.series_ok = 0
+        self.failed = []
+        self.csv_rescued = []
+
+    # ------------------------------------------------------------ 네트워크
+
+    def _throttle(self):
+        now = self._clock()
+        floor = self._earliest
+        if self._last is not None:
+            floor = max(floor or 0, self._last + self._min_interval)
+        if floor is not None and now < floor:
+            self._sleep(floor - now)
+        self._last = self._clock()
+
+    def _open(self, url):
+        self._throttle()
+        self.requests += 1
+        if self._opener is not None:
+            return self._opener(url, self._timeout)
+        ctx = self._ssl if self._ssl is not None else _ssl_context()
+        return urllib.request.urlopen(url, timeout=self._timeout, context=ctx).read()
+
+    def _get(self, url):
+        """살균된 예외만 던진다.
+
+        `raise … from None` 으로는 모자란다 — except 블록 **안에서** 던지면
+        `__context__` 에 원본 `HTTPError` 가 그대로 매달리고, 그 객체의 `.url` 에는
+        키가 들어 있다. 그래서 예외를 만들어 두고 블록 **밖에서** 던진다.
+        """
+        err = None
+        try:
+            return self._open(url)
+        except urllib.error.HTTPError as e:
+            err = self._as_error(e)
+        except Exception as e:
+            err = FredError(scrub(f'{type(e).__name__}: {e}', self.key), transient=True)
+        raise err
+
+    def _as_error(self, e):
+        body = ''
+        try:
+            # 지운 **뒤에** 자른다 — 자르는 경계에 걸친 키는 원래 키와 안 맞아 안 지워진다.
+            body = scrub(e.read().decode('utf-8', 'replace'), self.key)[:500]
+        except Exception:
+            pass
+        msg = body
+        try:
+            msg = json.loads(body).get('error_message') or body
+        except Exception:
+            pass
+        if e.code == 429:
+            self._honor_retry_after(e)
+        return FredError(scrub(f'HTTP {e.code}: {msg or e.reason}', self.key),
+                         status=e.code,
+                         auth=e.code in _AUTH_STATUS and bool(_KEY_WORDS.search(msg or '')),
+                         transient=e.code in TRANSIENT)
+
+    def _honor_retry_after(self, e):
+        try:
+            wait = float((e.headers or {}).get('Retry-After') or 0)
+        except (TypeError, ValueError):
+            return
+        if wait > 0:
+            self._earliest = self._clock() + min(wait, 60)
+
+    # ------------------------------------------------------------ 파싱
+
+    def _api_url(self, sid, limit=None):
+        q = [('series_id', sid), ('api_key', self.key or '')]
+        q += [(k, str(limit) if k == 'limit' and limit else v) for k, v in PINS]
+        return API + '?' + urllib.parse.urlencode(q)
+
+    def _json(self, url):
+        """빈 본문·HTML 오류 페이지도 전송 실패다 — `JSONDecodeError` 가 그대로 새면
+        preflight 의 CSV 폴백을 건너뛰고 수집 전체가 죽는다(2026-10-21)."""
+        body = self._get(url)
+        try:
+            return json.loads(body.decode('utf-8'))
+        except ValueError:
+            pass
+        # 점검 페이지는 앞부분이 DOCTYPE·meta 라 제목이 원인을 말한다(2026-10-22 실측
+        # 「Site Maintenance | St. Louis Fed」, 786 B).
+        m = _TITLE.search(body)
+        text = scrub((m.group(1) if m else body).decode('utf-8', 'replace'), self.key)
+        head = text.strip()[:120]
+        raise FredError(f'non-JSON response ({len(body)} bytes): {head!r}', transient=True)
+
+    def _api(self, sid):
+        payload = self._json(self._api_url(sid))
+        obs = payload.get('observations') or []
+        count = payload.get('count')
+        if isinstance(count, int) and count > LIMIT:
+            raise FredError(f'{sid}: truncated response ({count} > limit {LIMIT})')
+        rows = _pairs((o.get('date'), o.get('value')) for o in obs)
+        _assert_ascending(sid, rows)
+        return rows
+
+    def _csv(self, sid):
+        body = self._get(f'{CSV}?id={sid}').decode('utf-8')
+        rows = _pairs(tuple(line.split(',')[:2])
+                      for line in body.splitlines()[1:] if ',' in line)
+        _assert_ascending(sid, rows)
+        return rows
+
+    # ------------------------------------------------------------ 공개 API
+
+    def preflight(self):
+        """생산 호출 **전에** 전송을 한 번 정한다. 실행 중간에 안 바꾸는 이유는
+        섞인 실행을 하나로 이름 붙이면 텔레메트리가 거짓말이 되기 때문이다."""
+        if self.transport:
+            return self.transport
+        last = None
+        for _ in range(2):
+            try:
+                self._api_probe()
+                self.transport = 'api'
+                return self.transport
+            except FredError as e:
+                last = e
+                if not self.fallback:
+                    raise
+                if e.auth:
+                    self._degrade('api_key_rejected', e)
+                    return self.transport
+        self._degrade(f'preflight_failed:{last.status or "error"}' if last
+                      else 'preflight_failed', last)
+        return self.transport
+
+    def _api_probe(self):
+        self._json(self._api_url(PREFLIGHT_SID, limit=1))
+
+    def _degrade(self, reason, error=None):
+        """`reason` 은 분류만 남긴다 — status 가 없는 실패(네트워크·타임아웃·빈 본문)는
+        전부 `preflight_failed:error` 하나로 뭉쳐 원인을 못 읽는다(2026-10-21~22, 6회).
+        살균된 원문을 `error` 로 같이 남긴다. 키는 FredError 가 이미 지웠고 한 번 더 지운다."""
+        self.transport = 'csv'
+        self.reason = reason
+        self.error = scrub(error, self.key) if error is not None else None
+
+    def series(self, sid):
+        """오래된→최신 `(date, float)`. 실패는 예외 — 호출부 `retry()` 가 받는다."""
+        if sid in self._cache:
+            return self._cache[sid]
+        if not self.transport:
+            self.preflight()
+        try:
+            rows = self._fetch(sid)
+        except FredError:
+            if sid not in self.failed:
+                self.failed.append(sid)
+            raise
+        self._cache[sid] = rows
+        self.series_ok += 1
+        return rows
+
+    def _fetch(self, sid):
+        if self.transport != 'api':
+            return self._csv(sid)
+        try:
+            return self._api(sid)
+        except FredError as e:
+            if not self.fallback:
+                raise
+            if e.auth:
+                # 키가 실행 도중 거부됐다 — 남은 수십 회를 같은 벽에 던지지 않는다.
+                self._degrade('api_key_rejected', e)
+                return self._csv(sid)
+            # 일시 실패. 시리즈를 통째로 잃는 것이 더 비싸다 — 무키 시절 경로로
+            # 한 번 구제한다. 둘 다 실패하면 원래 예외를 올린다.
+            rescued = None
+            try:
+                rows = self._csv(sid)
+                rescued = rows
+            except FredError:
+                pass
+            if rescued is None:
+                raise e
+            if sid not in self.csv_rescued:
+                self.csv_rescued.append(sid)
+            return rows
+
+    def release_dates(self, start, end):
+        """-> [(date, release_id, release_name)] 오름차순. 구간 안의 발표 일정 전부.
+
+        **한 번만 부른다.** 릴리스마다 `release_id` 를 코드에 박고 13번 부르는 대신
+        구간 전체를 받아 이름으로 거른다 — 박아 둔 id 가 틀리면 다른 지표의 일정을
+        그 지표 이름으로 인쇄하는데, 그 오류는 화면에서 안 보인다.
+
+        `include_release_dates_with_no_data=true` 가 **미래 일정을 여는 열쇠**다.
+        빼면 이미 값이 붙은 과거 발표만 온다.
+        """
+        if self.transport != 'api':
+            raise FredError(f'release calendar needs the official API '
+                            f'(transport={self.transport or "unknown"})')
+        q = [('api_key', self.key or ''), ('file_type', 'json'),
+             ('realtime_start', start.isoformat()), ('realtime_end', end.isoformat()),
+             ('include_release_dates_with_no_data', 'true'),
+             ('sort_order', 'asc'), ('limit', str(DATES_LIMIT))]
+        url = RELEASES_DATES + '?' + urllib.parse.urlencode(q)
+        payload = json.loads(self._get(url).decode('utf-8'))
+        count = payload.get('count')
+        if isinstance(count, int) and count > DATES_LIMIT:
+            raise FredError(f'release calendar truncated ({count} > {DATES_LIMIT})')
+        out = []
+        for row in payload.get('release_dates') or []:
+            day, rid, name = row.get('date'), row.get('release_id'), row.get('release_name')
+            if not (day and name):
+                continue
+            try:
+                out.append((dt.date.fromisoformat(day), rid, name))
+            except ValueError:
+                continue
+        return sorted(out, key=lambda r: (r[0], str(r[2])))
+
+    def series_release(self, sid):
+        """-> (release_id, release_name). 시리즈가 속한 릴리스 **하나**.
+
+        0개·2개 이상·id 가 정수가 아님·이름이 비었음은 전부 `FredError` — 어느 릴리스인지
+        모르는 채로 일정을 그 지표 이름에 붙이지 않는다.
+        """
+        if self.transport != 'api':
+            raise FredError(f'series release needs the official API '
+                            f'(transport={self.transport or "unknown"})')
+        q = [('series_id', sid), ('api_key', self.key or ''), ('file_type', 'json')]
+        # `_json` 은 파싱 실패를 except **밖에서** 살균해 던진다 — 원문이 `__context__` 에
+        # 매달리지 않는다(codex 2026-11-07 구현 #3).
+        payload = self._json(SERIES_RELEASE + '?' + urllib.parse.urlencode(q))
+        rels = payload.get('releases') if isinstance(payload, dict) else None
+        if not isinstance(rels, list) or len(rels) != 1 or not isinstance(rels[0], dict):
+            raise FredError(scrub(f'{sid}: expected one release, got '
+                                  f'{len(rels) if isinstance(rels, list) else "none"}', self.key))
+        rid, name = rels[0].get('id'), rels[0].get('name')
+        if type(rid) is not int or not isinstance(name, str) or not name.strip():
+            # 응답에서 온 값은 무엇이든 담을 수 있다 — 키까지(codex 2026-11-07 구현 #2).
+            raise FredError(scrub(f'{sid}: malformed release ({rid!r}, {name!r})', self.key))
+        return rid, name
+
+    def vintage(self, sid, obs_start, obs_end, as_of):
+        """-> [{date, realtime_start, realtime_end, value}] — `output_type=1` 의 실시간
+        이력 행. 관측 구간 `obs_start..obs_end`, 실시간 창 `as_of−40일..as_of`.
+
+        값이 `.` 인 행은 value None 으로 남긴다(그날 「값 없음」이었다는 사실도 이력이다).
+        CSV 경로에는 이력이 없다 — 공식 API 만.
+        """
+        if self.transport != 'api':
+            raise FredError(f'vintage rows need the official API '
+                            f'(transport={self.transport or "unknown"})')
+        end = dt.date.fromisoformat(str(as_of)[:10])
+        q = [('series_id', sid), ('api_key', self.key or ''), ('file_type', 'json'),
+             ('observation_start', str(obs_start)), ('observation_end', str(obs_end)),
+             ('realtime_start', (end - dt.timedelta(days=VINTAGE_DAYS)).isoformat()),
+             ('realtime_end', end.isoformat()), ('output_type', '1'), ('units', 'lin'),
+             ('sort_order', 'asc'), ('limit', str(LIMIT))]
+        payload = self._json(API + '?' + urllib.parse.urlencode(q))
+        count = payload.get('count') if isinstance(payload, dict) else None
+        if isinstance(count, int) and count > LIMIT:
+            raise FredError(f'{sid}: truncated vintage response ({count} > limit {LIMIT})')
+        out = []
+        for o in (payload.get('observations') or []) if isinstance(payload, dict) else []:
+            day, rs, re_ = o.get('date'), o.get('realtime_start'), o.get('realtime_end')
+            if not (day and rs and re_):
+                continue
+            raw = o.get('value')
+            try:
+                value = None if raw in ('.', '', None) else float(raw)
+            except (TypeError, ValueError):
+                value = None
+            out.append({'date': day, 'realtime_start': rs, 'realtime_end': re_,
+                        'value': value})
+        return out
+
+    def last_release_date(self, release_id, as_of):
+        """-> 'YYYY-MM-DD' | None. `release_id` 의 `as_of` 이하 가장 최근 발표일.
+
+        상한을 **요청에** 넣는다(`realtime_end=as_of`) — 내림차순 상위 몇 개를 받은 뒤
+        거르면 미래 일정이 섞인 응답에서 오늘 이하가 잘려 나갈 수 있다(codex 5회 #6).
+        데이터 없이 일정만 있는 날(`include_release_dates_with_no_data`)은 빼고 받는다.
+        """
+        if self.transport != 'api':
+            raise FredError(f'release dates need the official API '
+                            f'(transport={self.transport or "unknown"})')
+        end = dt.date.fromisoformat(str(as_of)[:10])
+        q = [('release_id', str(release_id)), ('api_key', self.key or ''), ('file_type', 'json'),
+             ('realtime_start', (end - dt.timedelta(days=400)).isoformat()),
+             ('realtime_end', end.isoformat()), ('sort_order', 'desc'), ('limit', '20'),
+             ('include_release_dates_with_no_data', 'false')]
+        payload = self._json(RELEASE_DATES + '?' + urllib.parse.urlencode(q))
+        rows = (payload.get('release_dates') or []) if isinstance(payload, dict) else []
+        days = []
+        for row in rows:
+            try:
+                d = dt.date.fromisoformat(str(row.get('date'))[:10])
+            except ValueError:
+                continue
+            if d <= end:
+                days.append(d)
+        return max(days).isoformat() if days else None
+
+    def telemetry(self):
+        return {'transport': self.transport or 'unknown',
+                'reason': self.reason,
+                'error': self.error,
+                'key_configured': bool(self.key),
+                'degraded': bool(self.key) and self.transport != 'api',
+                'requests': self.requests,
+                'series_ok': self.series_ok,
+                'failed': sorted(self.failed),
+                'csv_rescued': sorted(self.csv_rescued)}
+
+
+def annotation(text):
+    """GitHub `::warning::`/`::error::` 한 줄로 안전하게. 응답 본문의 개행 뒤 `::error::` 가
+    별도 명령으로 실행되지 않게 `%`·CR·LF 를 공식 규칙대로 이스케이프한다."""
+    return str(text).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+
+def key_health(telemetry, key_set):
+    """-> (level, message). 'error' 는 **키가 거부됐을 때만**이다(사용자 지시 2026-10-22).
+    점검·장애로 API 가 안 될 때는 키를 확인할 수 없을 뿐이라 'warning' — 데이터는 CSV 로 이미
+    커밋됐고, 빨간 실행이 매일 쌓이면 진짜 거부가 그 사이에 묻힌다."""
+    f = telemetry or {}
+    if not key_set or not f.get('degraded'):
+        return 'ok', f"fred transport={f.get('transport')} ok"
+    cause = annotation(f"{f.get('reason')}: {f.get('error')}")
+    if f.get('reason') == 'api_key_rejected':
+        return 'error', (f'FRED API key rejected ({cause}) — '
+                         f'data was collected from the unofficial graph CSV')
+    return 'warning', (f'FRED API unavailable, key not verified ({cause}) — '
+                       f'data was collected from the unofficial graph CSV')
+
+
+def _pairs(rows):
+    out = []
+    for d, v in rows:
+        if not d or v in ('.', '', None):
+            continue
+        try:
+            out.append((d.strip(), float(v)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _assert_ascending(sid, rows):
+    for a, b in zip(rows, rows[1:]):
+        if a[0] > b[0]:
+            raise FredError(f'{sid}: observations are not in ascending date order')

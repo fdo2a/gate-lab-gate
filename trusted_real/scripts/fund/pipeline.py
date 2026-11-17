@@ -1,0 +1,58 @@
+"""Board assembly as one callable: build -> render -> publish, failure -> `publish.failed`.
+
+Moved out of `collect_market_data.main()` unchanged so it can be tested end to end.
+JSON is always written; HTML only when renderable; a crash leaves the unavailable JSON
+and removes yesterday's HTML.
+
+The board sees exactly the tickers it saw before the factor trial: histories that were
+downloaded **only** for the factor model (`factor_legs.FACTOR_ONLY`) are dropped here, so
+a bad factor leg can never change the board's `missing`, status or digest. This file must
+not import `fund.factors` (or numpy) — the board cannot depend on the factor model
+importing cleanly. The leg list is read lazily and an import failure drops nothing: the
+collector's download set falls back to the pre-trial set on the same failure.
+"""
+
+import sys
+
+from fund import publish
+
+
+def _factor_only():
+    try:
+        from fund.factor_legs import FACTOR_ONLY
+        return frozenset(FACTOR_ONLY)
+    except Exception:
+        return frozenset()
+
+
+def board_inputs(closes, dates):
+    """The board's view of the histories: everything except the factor-only legs."""
+    FACTOR_ONLY = _factor_only()
+    return ({t: c for t, c in (closes or {}).items() if t not in FACTOR_ONLY},
+            {t: d for t, d in (dates or {}).items() if t not in FACTOR_ONLY})
+
+
+def run(closes, hist_dates, data, liq_series, report_date, generated_at, outdir, holidays,
+        handle_errors=True):
+    """handle_errors=False: 예외를 그대로 올린다 — collect_market_data.fund_board_step 의
+    바깥 except 하나만 실패 JSON 을 쓰게 해 ed17327 인라인과 쓰기 횟수·기록 원인을 맞춘다
+    (codex impl review 2 #2)."""
+    try:
+        from fund import core, render
+        b_closes, b_dates = board_inputs(closes, hist_dates)
+        board = core.build(b_closes, b_dates, data, liq_series, report_date, generated_at,
+                           holidays=holidays)
+        publish.write(outdir, 'fund_board.json', 'fund_board.html', board,
+                      render.board_html(board))
+        mr = board.get('market_regime') or {}
+        print(f"  status {board['status']} · 국면 {mr.get('name')} · "
+              f"순위 {(board.get('rank_basis') or {}).get('n')}종"
+              + (f" · missing {board['missing']}" if board['missing'] else ''))
+        return board
+    except Exception as e:
+        if not handle_errors:
+            raise
+        print(f'fund board failed: {e}', file=sys.stderr)
+        failed = publish.failed(report_date, generated_at, e, universe=True)
+        publish.write(outdir, 'fund_board.json', 'fund_board.html', failed, None)
+        return failed

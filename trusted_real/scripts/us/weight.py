@@ -1,0 +1,458 @@
+"""발행본의 무게중심을 재는 게이트 — 시황·가격 대 판단·포지션.
+
+2026-08-27 실측에서 판단·포지션이 7,424자(53%)·시황·가격이 3,676자(26%)였다.
+자수는 엔티티를 디코드한 뒤 센다 — 단순 태그 제거는 &amp;를 5자로 세므로
+여기서 쓰지 않는다(2026-08-30 codex 검토).
+"""
+import html as _html
+import re
+from common.numbers import TAG_RE
+
+# 주석·속성값 안의 `>` 까지 한 토큰으로 읽는다 — 정본은 common/numbers.py
+_TAG = TAG_RE
+_CELL_MIN = 40
+
+
+def _text(fragment):
+    return _html.unescape(_TAG.sub('', fragment)).strip()
+
+
+def section_slice(html_doc, title):
+    """제목이 정확히 `title`인 <h2>가 여는 구간. 없으면 None.
+
+    본문 폴백을 두지 않는다 — 「주식」·「채권」은 헤드라인에도 나오는 흔한 말이라
+    부분일치로 찾으면 엉뚱한 구간을 잡는다(2026-08-30 codex 검토).
+    """
+    heads = [m.start() for m in re.finditer(r'<h2\b[^>]*>(.*?)</h2>', html_doc, re.S)
+             if _text(m.group(1)) == title]
+    if not heads:
+        return None
+    start = heads[0]
+    stops = [m.start() for m in re.finditer(r'<h2\b|<footer\b|</main\b', html_doc)
+             if m.start() > start]
+    return html_doc[start:stops[0] if stops else len(html_doc)]
+
+
+# 병합 섹션(2026-09-12 사용자 지시 「하나로 합쳐」) 안에서 포트폴리오가 시작하는 자리.
+PORTFOLIO_SUBTITLE = '모의 포트폴리오'
+_H3 = re.compile(r'<h3\b[^>]*>(.*?)</h3>', re.S)
+
+
+_SECTION_OPEN = re.compile(r'(?i)<section\b')
+_SECTION_CLOSE = re.compile(r'(?i)</section\s*>')
+
+
+def section_scope(html_doc, title):
+    """제목이 `title`인 <h2>를 담은 **실제 `<section>` 안쪽**. 없으면 h2 구간 그대로.
+
+    `section_slice` 는 다음 h2 까지 읽으므로, 형제 `<aside>`·`<div>` 에 놓인 블록이
+    이 섹션의 자식인 것처럼 검사된다(2026-09-12 codex 구현 검토). 중첩 `<section>`
+    (섹터 막대 스니펫)이 있으므로 깊이를 세어 짝을 찾는다.
+    """
+    seg = section_slice(html_doc, title)
+    if seg is None:
+        return None
+    start = html_doc.index(seg)
+    open_at = html_doc.rfind('<section', 0, start)
+    if open_at < 0:
+        return seg
+    depth, i = 0, open_at
+    while i < len(html_doc):
+        o = _SECTION_OPEN.search(html_doc, i)
+        c = _SECTION_CLOSE.search(html_doc, i)
+        if c is None:
+            break
+        if o is not None and o.start() < c.start():
+            depth += 1
+            i = o.end()
+            continue
+        depth -= 1
+        if depth == 0:
+            end = c.start()
+            return seg[:end - start] if end > start else seg
+        i = c.end()
+    return seg
+
+
+def sub_split(section_html, title):
+    """h2 구간을 «그 제목의 <h3> 앞»과 «h3부터 구간 끝»으로 가른다.
+
+    뒤쪽의 끝을 «다음 h3»으로 잡지 않는다 — h3 를 하나 더 두면 그 뒤가 검사 밖
+    꼬리가 된다(2026-09-12 codex 설계 검토 C2-4). 끝은 부모 구간의 끝이다.
+    h3 가 없으면 (전체, None).
+    """
+    if not section_html:
+        return (section_html, None)
+    for m in _H3.finditer(section_html):
+        if _text(m.group(1)) == title:
+            return (section_html[:m.start()], section_html[m.start():])
+    return (section_html, None)
+
+
+def prose_chars(section_html):
+    """문단 + 서술형 표 칸(40자 초과)의 글자 수. 캡션은 뺀다.
+
+    표 칸을 함께 세는 것은 산문을 표로 밀어 넣어 비율을 맞추는 우회를 막기 위해서다.
+    """
+    if not section_html:
+        return 0
+    n = 0
+    for attrs, body in re.findall(r'<p([^>]*)>(.*?)</p>', section_html, re.S):
+        if 'caption' in attrs:
+            continue
+        n += len(_text(body))
+    for body in re.findall(r'<td[^>]*>(.*?)</td>', section_html, re.S):
+        t = _text(body)
+        if len(t) > _CELL_MIN:
+            n += len(t)
+    return n
+
+
+# 「멀티에셋 전략·포트폴리오」는 2026-09-19 사용자 지시로 없어졌다. 옛 발행본에는 그
+# 섹션이 남아 있지만 새 글은 갖지 않는다 — 분량 계약에서 뺀다.
+# Compatibility exports for historical portfolio/stance review modules.
+STANCE_TITLE = '멀티에셋 전략·포트폴리오'
+LEGACY_TITLES = {STANCE_TITLE: '멀티에셋 매니저 전략'}
+RETIRED_TITLES = ('멀티에셋 전략·포트폴리오', '멀티에셋 매니저 전략', '모의 포트폴리오')
+
+SECTION_GROUPS = {
+    'us': {
+        'recap': ('오늘의 장', '주식', '채권', 'FX', '원자재'),
+        'judgment': ('전략 코멘트', '매크로'),
+    },
+    'kr': {
+        'recap': ('오늘의 장', '지수 & 장중', '환율·금리'),
+        'judgment': ('전략 코멘트', '기술적 분석 & 트레이딩 전략'),
+    },
+}
+
+# 「연준 이벤트」는 사건 기록이면서 해석이라 진단용 비율에서도 별도로 둔다.
+# 「오늘의 장」은 옛 판에 없으며 신규 발행본 존재 검사는 check_session.py가 맡는다.
+OPTIONAL_SECTIONS = ('오늘의 장',)
+
+# 길이 하한과 비율 문턱은 패딩을 유도하므로 쓰지 않는다. 비율은 measure()의 진단값.
+# 매크로 중복을 억제하는 상한과 필수 섹션의 존재·내용 검사는 유지한다.
+THRESHOLDS = {
+    'us': {'macro_max': 4600, 'macro_max_abbrev': 2400},
+    # KR 시황군 2,200·판단군 1,800 절대 하한은 2026-10-13 사용자 결정으로 폐지했다 — 글자
+    # 수보다 핵심 시장 정보의 누락을 먼저 본다. 균형(시황군 ≥ 판단군)은 아래 warnings() 의 경고다.
+    'kr': {},
+}
+
+# 서술형 본문 권장 분량(2026-10-13 사용자 결정, `STYLE_EXEMPLARS.md` §11). 평상시 4,000~5,000자,
+# **경고만** 하고 하한 경고는 두지 않는다 — 정보가 적은 날은 짧아도 되고, 큰 사건이 있는 날은
+# 넘어도 된다. 기간이 지났다고 차단으로 바꾸지 않는다(2026-10-13 사용자 결정, STYLE_EXEMPLARS §11).
+NARRATIVE_TARGET = (4000, 5000)
+# 수집 단계가 만든 기사 요약 섹션 — 작성자가 줄일 수 없어 따로 센다(US 일간에는 없다).
+NEWS_SECTIONS = ('오늘의 뉴스',)
+
+
+def narrative(html_doc, market='us'):
+    """서술형 본문 글자 수(공백 제외) — {'body', 'news', 'all'}.
+
+    범위는 `style._prose_html` 과 같다(표·제목·캡션·뉴스 요약 data-summary·근거 블록·생성 구간
+    제외). 엔티티를 디코드한 뒤 공백을 지우고 센다. US 10/12 = 7,496자가 이 기준이다.
+    """
+    from us import style
+
+    def count(fragment):
+        paras = style._prose_html('<body>' + (fragment or '') + '</body>')
+        return sum(len(re.sub(r'\s', '', _html.unescape(style._text(x)))) for x in paras)
+
+    total = count(html_doc)
+    news = sum(count(section_slice(html_doc, t)) for t in NEWS_SECTIONS
+               if section_slice(html_doc, t))
+    return {'body': total - news, 'news': news, 'all': total}
+
+
+def warnings(html_doc, market='us'):
+    """발행을 막지 않는 분량·균형 경고(2026-10-13)."""
+    out = []
+    n = narrative(html_doc, market)
+    lo, hi = NARRATIVE_TARGET
+    if n['body'] > hi:
+        news = f', 뉴스 요약 {n["news"]}자 별도' if n['news'] else ''
+        out.append(f'서술형 본문이 {n["body"]}자다(평상시 {lo:,}~{hi:,}자{news}) — 큰 사건이 있는 날이 '
+                   '아니면 반복 해석·장중 시각·변화 없는 판단부터 덜어낸다. 중요한 분석은 지우지 않는다')
+    m = measure(html_doc, market)
+    macro = m['sections'].get('매크로', 0)
+    hi = THRESHOLDS[market].get('macro_max')
+    if hi and macro > hi:
+        out.append(f'매크로가 {macro}자로 평소 상한 {hi:,}자를 넘는다 — 발표가 몰린 날이면 괜찮다. '
+                   '해부가 아닌 반복 해석부터 덜어낸다(2026-11-08 사용자 지시로 차단 → 경고)')
+    if m['judgment'] and m['recap'] < m['judgment']:
+        out.append(f'시황군 {m["recap"]}자 < 판단군 {m["judgment"]}자 — 중요한 분석이 몰린 날이 아니면 '
+                   '주요 자산의 움직임·큰 변동의 원인·자산 간 연결이 빠졌는지 점검한다(비율을 맞추려고 '
+                   '시황을 덧붙이지 않는다)')
+    return out
+
+
+def measure(html_doc, market='us'):
+    """{'sections', 'recap', 'judgment', 'ratio', 'missing'}."""
+    groups = SECTION_GROUPS[market]
+    sections, missing = {}, []
+    for group in ('recap', 'judgment'):
+        for title in groups[group]:
+            seg = section_slice(html_doc, title)
+            if seg is None:
+                sections[title] = 0
+                if title not in OPTIONAL_SECTIONS:
+                    missing.append(title)
+            else:
+                sections[title] = prose_chars(seg)
+    recap = sum(sections[t] for t in groups['recap'])
+    judgment = sum(sections[t] for t in groups['judgment'])
+    out = {'sections': sections, 'recap': recap, 'judgment': judgment,
+           'ratio': (recap / judgment) if judgment else None, 'missing': missing}
+    if market == 'us':
+        # 축약일 2,400자는 발표 해부 블록을 빼고 잰다(2026-11-08) — 발표가 겹친 날 필수 해부가
+        # 접힌 §9 를 넘기지 않게. 블록 경계는 게이트와 같은 파서(us.release_blocks).
+        from us.release_blocks import without_blocks
+        seg = section_slice(html_doc, '매크로')
+        out['macro_ex_anatomy'] = prose_chars(without_blocks(seg)) if seg is not None else 0
+    return out
+
+
+def check_volume(m, abbreviated=False, market='us'):
+    t = THRESHOLDS[market]
+    v = []
+    for title in m['missing']:
+        v.append(f'섹션 「{title}」을 찾지 못했다 — <h2>{title}</h2>가 있어야 분량을 잰다')
+
+    for title, count in m['sections'].items():
+        if title not in OPTIONAL_SECTIONS and title not in m['missing'] and count == 0:
+            v.append(f'섹션 「{title}」의 본문이 비어 있다 — 필수 설명을 남길 것')
+
+    if market == 'us' and abbreviated:
+        # 발표일 4,600자는 2026-11-08 사용자 지시로 경고가 됐다(warnings()). 차단은 축약일뿐이다.
+        macro = m.get('macro_ex_anatomy', m['sections'].get('매크로', 0))
+        hi = t['macro_max_abbrev']
+        if macro > hi:
+            v.append(f'매크로가 발표 해부를 빼고 {macro}자로 축약일 상한 {hi}자를 넘는다')
+
+    return v
+
+
+_MIN_BLOCK = 120
+_BIG_BANDS = ('큼', '매우 큼')
+
+# 섹션 ← 그 섹션이 책임지는 price_context 자산
+SECTION_ASSETS = {
+    'us': {
+        '주식': ('S&P 500', 'Nasdaq', 'Russell 2000', 'VIX'),
+        '채권': ('10Y', '30Y'),
+        'FX': ('DXY', 'USD/JPY', 'USD/KRW'),
+        '원자재': ('WTI', 'Gold'),
+    },
+    'kr': {'지수 & 장중': (), '환율·금리': ()},
+}
+
+STANDING_KEYS = {'주식': 'equities', '채권': 'bonds', 'FX': 'fx', '원자재': 'commodities',
+                 '지수 & 장중': 'equities', '환율·금리': 'rates'}
+
+# 등급 통제 어휘. 단독 「중립」은 뺀다 — 주식·원자재의 0등급 라벨이 하필 일상 어휘라
+# 「거의 중립적인 하루」를 매일 오탐한다. 다어절 라벨과 OW·UW만 잡는다.
+BANNED_GRADE_WORDS = (
+    '비중확대', '소폭확대', '소폭축소', '비중축소',
+    '숏 듀레이션', '숏 바이어스', '중립 듀레이션', '롱 바이어스', '롱 듀레이션',
+    '달러 숏', '달러 소폭 숏', '달러 중립', '달러 소폭 롱', '달러 롱',
+    '플래트너', '커브 중립', '스티프너', '벨리 OW',
+)
+_OW_UW = re.compile(r'(?<![A-Za-z])(OW|UW)(?![A-Za-z])')
+
+VOCAB_SECTIONS = {'us': ('오늘의 장', '주식', '채권', 'FX', '원자재'),
+                  'kr': ('오늘의 장', '지수 & 장중', '환율·금리')}
+
+LEDE_ORDER = ('event', 'meaning', 'action', 'invalidation')
+# KR §2 는 2026-09-22 여섯 블록이 됐다(기대 차이·복기 추가). 정본은 kr/stance_gate.ORDER —
+# 여기서 넷을 요구하면 check_kr_stance 와 동시에 통과할 수 없다(2026-09-23 실측).
+LEDE_ORDERS = {'us': LEDE_ORDER,
+               'kr': ('event', 'gap', 'meaning', 'action', 'invalidation', 'review')}
+# 2026-10-20 부터 KR §2 는 review 를 뺀 다섯이다(review 는 「시장 판단과 복기」로). 어느 배치를
+# 요구할지는 발행일을 아는 check_kr_stance 가 정한다 — 여기서는 둘 중 하나와 정확히 같으면 된다.
+LEDE_ORDERS_ALT = {'us': (), 'kr': (LEDE_ORDERS['kr'][:-1],)}
+
+_TODAY_CUE = re.compile(r'오늘|전일 대비|마감|하루 변화')
+
+
+def _paras(section_html):
+    return [(a, _text(b)) for a, b in
+            re.findall(r'<p([^>]*)>(.*?)</p>', section_html or '', re.S)]
+
+
+def _marked(section_html, attr):
+    """`<p data-attr="...">` 문단들의 (값, 텍스트)."""
+    out = []
+    for attrs, text in _paras(section_html):
+        m = re.search(rf'\b{attr}\s*=\s*"([^"]*)"', attrs)
+        if m:
+            out.append((m.group(1), text))
+    return out
+
+
+def check_standing(html_doc, price_context, market='us'):
+    """가격 섹션마다 「지금 어디에 있나」 문단이 있고 알맹이가 있는가.
+
+    기준은 「이걸 본 사람이 요즘 주식·채권시장 어떠냐는 질문에 대답할 수 있는가」다.
+    """
+    if not price_context:
+        return []
+    v = []
+    for title in SECTION_ASSETS[market]:
+        seg = section_slice(html_doc, title)
+        if seg is None:
+            continue
+        blocks = _marked(seg, 'data-standing')
+        if not blocks:
+            v.append(f'{title}: 「지금 어디에 있나」 문단이 없다 — '
+                     f'<p data-standing="{STANDING_KEYS[title]}">로 시작할 것')
+            continue
+        # 2026-10-13 사용자 결정 — 120자·「위치·경로·오늘의 크기 세 층」 요구를 폐지했다.
+        # 평범한 날은 종가·등락률이면 되고, 위치는 극단·이례적일 때만 쓴다(§11-3).
+        if not any(re.search(r'\d', t) for _, t in blocks):
+            v.append(f'{title}: 「지금 어디에 있나」 문단에 수치가 없다 — 종가·등락률을 쓴다')
+    return v
+
+
+def check_cause(html_doc, price_context, market='us'):
+    """크게 움직인 자산은 원인 문단을 갖는가. 미미·보통이면 면제.
+
+    분량이 아니라 사건에 건다 — DXY가 -0.04% 움직인 날 FX에 700자를 쓰라는 것은
+    패딩 지시이고 「band가 미미인 자산은 한 줄로 지나간다」와 어긋난다.
+    """
+    moves = (price_context or {}).get('moves') or {}
+    if not moves:
+        return []
+    v = []
+    for title, assets in SECTION_ASSETS[market].items():
+        big = [a for a in assets if (moves.get(a) or {}).get('band') in _BIG_BANDS]
+        if not big:
+            continue
+        seg = section_slice(html_doc, title)
+        if seg is None:
+            continue
+        blocks = [t for _, t in _marked(seg, 'data-cause')
+                  if len(t) >= _MIN_BLOCK and re.search(r'\d', t)]
+        if not blocks:
+            v.append(f'{title}: {", ".join(big)}이(가) 크게 움직였는데 원인 문단이 없다 — '
+                     f'<p data-cause="...">에 {_MIN_BLOCK}자 이상, 수치 하나 이상')
+    return v
+
+
+def _numbers(text):
+    """비교용 (수치, 단위) 쌍. 콤마를 걷고 유니코드 마이너스를 통일한다.
+
+    단위를 함께 묶는 이유는 `-0.50%`와 `+0.50%p`가 같은 값으로 뭉개지는 것을 막기
+    위해서다(2026-08-30 codex 검토). 부호는 버린다 — 같은 수치의 방향이 다르면 그건
+    중복이 아니라 오류이고, 그 검사는 verify_post가 한다.
+
+    **세 자리 미만은 뺀다.** 「+2bp」 같은 짧은 수치는 우연히 겹치는 일이 잦아 잡으면
+    오탐이 쏟아진다 — 그래서 이 검사는 `10년물 +2bp` 중복을 놓친다. 놓치는 쪽을 택했다.
+    """
+    t = text.replace(',', '').replace('−', '-')
+    out = set()
+    for m in re.finditer(r'(\d+\.?\d*)\s*(%p|%|bp|달러|엔|원|포인트)?', t):
+        tok, unit = m.group(1), m.group(2) or ''
+        if len(tok.replace('.', '')) < 3:
+            continue
+        if tok.isdigit() and 1900 <= int(tok) <= 2100:
+            continue
+        out.add((tok, unit))
+    return out
+
+
+# 경로 그룹 ← 그 경로의 가격을 인쇄하는 자산 섹션
+GROUP_SECTIONS = {
+    'rates': ('채권', '원자재'),
+    'demand': ('주식', '원자재'),
+    'dollar': ('FX',),
+    'ai_cycle': ('메모리/DRAM', 'AI 인프라'),
+}
+
+
+def check_macro_prices(html_doc, market_data=None):
+    """§9 경로 블록이 자산 섹션에 이미 있는 그날 가격을 되풀이하지 않는가.
+
+    market_data와 대조하지 않는다 — 발행본 표기가 원천값과 어긋나는 일이 흔하다
+    (2026-08-27 실측: 금 4,641.3 대 본문 4,663, DXY 99.114 대 99.13). 중복의 정의는
+    「같은 숫자가 두 자리에 있다」이므로 두 자리를 직접 맞댄다.
+
+    수치 중복만 본다 — 「달러는 소폭 내렸다」 같은 말바꿈은 잡지 못한다.
+    """
+    seg = section_slice(html_doc, '매크로')
+    if seg is None:
+        return []
+    printed = {}
+    for group, titles in GROUP_SECTIONS.items():
+        nums = set()
+        for title in titles:
+            sec = section_slice(html_doc, title)
+            if sec:
+                nums |= _numbers(' '.join(t for _, t in _paras(sec)))
+        printed[group] = nums
+
+    v = []
+    for m in re.finditer(r'<div[^>]*data-macro-group="([a-z_]+)"[^>]*>(.*?)</div>',
+                         seg, re.S):
+        key, text = m.group(1), _text(m.group(2))
+        for sent in re.split(r'(?<=다)\.\s*', text):
+            if not _TODAY_CUE.search(sent):
+                continue
+            hit = _numbers(sent) & printed.get(key, set())
+            if hit:
+                shown = ', '.join(f'{n}{u}' for n, u in sorted(hit))
+                v.append(f'§9 {key}: 자산 섹션에 이미 있는 그날 가격({shown})을 '
+                         '되풀이했다 — 여기에는 경로 논리와 확인 지표만 쓸 것')
+                break
+    return v
+
+
+def check_position_vocab(html_doc, market='us'):
+    """가격 섹션이 스탠스 등급을 되풀이하지 않는가."""
+    v = []
+    for title in VOCAB_SECTIONS[market]:
+        seg = section_slice(html_doc, title)
+        if seg is None:
+            continue
+        text = ' '.join(t for _, t in _paras(seg))
+        # 「스프레드가 소폭확대됐다」·「종목 비중확대로」처럼 등급이 아니라 서술로 쓰인
+        # 자리는 뺀다 — 문맥 없는 부분문자열 금지는 정상 시황을 매일 잡는다(codex 검토).
+        found = [w for w in BANNED_GRADE_WORDS
+                 if re.search(re.escape(w) + r'(?![되돼됐된하한할해했로])', text)]
+        if _OW_UW.search(text):
+            found.append('OW/UW')
+        if found:
+            v.append(f'{title}: 포지션 등급 어휘({", ".join(sorted(set(found)))})가 나왔다 — '
+                     '스탠스는 멀티에셋 섹션에서만 말한다')
+    return v
+
+
+def check_lede(html_doc, market='us'):
+    """§2가 사건 → 의미 → 행동 → 무효화 순인가(KR 은 기대 차이·복기를 더한 여섯)."""
+    order = LEDE_ORDERS[market]
+    seg = section_slice(html_doc, '전략 코멘트')
+    if seg is None:
+        return ['섹션 「전략 코멘트」를 찾지 못했다']
+    got = [k for k, _ in _marked(seg, 'data-lede')]
+    if any(got == list(alt) for alt in LEDE_ORDERS_ALT[market]):
+        return []
+    v = [f'§2: data-lede="{k}" 문단이 없다' for k in order if k not in got]
+    if not v and got != list(order):
+        v.append(f'§2: data-lede 순서가 {" → ".join(got)}이다 — '
+                 f'{" → ".join(order)} 순이어야 한다')
+    return v
+
+
+def check(html_doc, market='us', market_data=None, macro_eval=None):
+    """모든 검사를 돌려 위반 문자열 리스트를 낸다. 빈 리스트면 발행 가능."""
+    abbreviated = bool((macro_eval or {}).get('abbreviated'))
+    pc = (market_data or {}).get('price_context') or {}
+    v = []
+    v += check_volume(measure(html_doc, market), abbreviated, market)
+    v += check_standing(html_doc, pc, market)
+    v += check_cause(html_doc, pc, market)
+    v += check_position_vocab(html_doc, market)
+    v += check_lede(html_doc, market)
+    if market == 'us':
+        v += check_macro_prices(html_doc)
+    return v

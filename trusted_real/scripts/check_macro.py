@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Publication gate for §8 (매크로).
+
+Run from the repo clone, against the writer's output in the routine workspace:
+
+  python scripts/check_macro.py --html morning_brief_2026-08-19.html --datadir .
+
+Exit 0 = publishable. Exit 1 = violations printed, one per line; hand them back to
+the writer subagent verbatim and re-run.
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from us.macro_gate import check  # noqa: E402
+
+
+def load(path):
+    try:
+        with open(path, encoding='utf-8') as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f'WARN: could not read {path}: {e}', file=sys.stderr)
+        return None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--html', required=True)
+    ap.add_argument('--datadir', default='.',
+                    help='workspace holding macro.json / macro_eval.json / '
+                         'macro_next.json')
+    ap.add_argument('--next', dest='next_path', default=None,
+                    help='override the macro_next.json path')
+    ap.add_argument('--legacy-releases', action='store_true',
+                    help="re-checking a past post against its own commit's data: a missing "
+                         'releases index keeps the pre-2026-11-06 strict reading')
+    args = ap.parse_args()
+
+    try:
+        with open(args.html, encoding='utf-8') as fh:
+            html = fh.read()
+    except OSError as e:
+        print(f'FATAL: cannot read {args.html}: {e}', file=sys.stderr)
+        sys.exit(2)
+
+    d = args.datadir
+    prev = load(os.path.join(d, 'macro.json'))
+    ev = load(os.path.join(d, 'macro_eval.json'))
+    nxt = load(args.next_path or os.path.join(d, 'macro_next.json'))
+
+    if prev is None and ev is None:
+        print('macro.json / macro_eval.json 둘 다 없다 — 부트스트랩 실행으로 간주하고 '
+              '§8 어휘·표 완성도만 검사한다', file=sys.stderr)
+
+    market = load(os.path.join(d, 'market_data.json')) or {}
+
+    # 축 표 게이트의 기준일은 세션(market_data)이다. metrics 가 그 날짜·현행 스키마가
+    # 아니면 추세 칸은 「—」만 허용된다 — 어제 추세가 오늘 숫자 옆에 나가지 않게.
+    econ = (load(os.path.join(d, 'econ_indicators.json')) or {}).get('indicators')
+    if not econ and market.get('report_date'):
+        print('WARN: econ_indicators.json 이 없거나 읽을 수 없다 — §9 축 표(직전 대비·추세) '
+              '검사를 건너뛴다. 표의 Actual/Previous 를 대조할 정본이 없다', file=sys.stderr)
+    metrics = load(os.path.join(d, 'macro_metrics.json'))
+    if econ and metrics and metrics.get('report_date') != market.get('report_date'):
+        print(f"WARN: macro_metrics.json report_date={metrics.get('report_date')}, "
+              f"세션 {market.get('report_date')} — 추세 칸은 「—」만 허용", file=sys.stderr)
+    # 원문 index (2026-11-06 계약): 오늘 세션 것이 아니면 「원문 없음」으로 — 낡은 원문을
+    # 근거로 해부 블록을 요구하지 않는다. status 없는 옛 index 는 그대로 넘겨 옛 판정을 유지.
+    releases = load(os.path.join(d, 'releases', 'index.json'))
+    if not args.legacy_releases and (releases is None or releases.get('status') is None):
+        # Publishing now: no readable index — or one from before the 2026-11-06 contract,
+        # which check_sources and the writer also treat as empty — means no release text.
+        releases = {'status': 'missing' if releases is None else 'legacy', 'releases': []}
+    elif releases and releases.get('status') is not None \
+            and releases.get('report_date') != market.get('report_date'):
+        releases = {'status': 'stale', 'releases': []}
+    violations = check(html, prev, ev, nxt, econ=econ, metrics=metrics,
+                       report_date=market.get('report_date'), releases=releases)
+    if not violations:
+        print('매크로 게이트 통과')
+        return
+    print(f'매크로 게이트 실패 — {len(violations)}건')
+    for x in violations:
+        print(f'  - {x}')
+    sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,715 @@
+"""말투가 기관 보고서로 굳었는지 기계적으로 재는 검사.
+
+「말하듯이 쓴다」는 기준(`.claude/agents/brief-report-writer.md`)은 대부분 사람이 읽어야
+아는 것이지만, 굳은 말투는 몇 가지 **셀 수 있는 자국**을 남긴다. 2026-08-20·21 발행본
+415문장을 실측했을 때 나온 것들이 그대로 여기 임계가 됐다 — 개조식 라벨 28회, 비인칭
+피동 20회, `~에 따른` 8회, 명사형 종결 7회, 문두 `다만` 14회, `-다` 종결 89.9%.
+
+임계는 넉넉하다. 한두 번은 문체가 아니라 그 문장에 맞는 표현일 수 있고, 매일 걸리는
+검사는 곧 무시당한다. 잡으려는 것은 **반복**이다.
+
+Pure — HTML 문자열을 받아 findings를 돌려준다.
+"""
+
+import re
+
+_SCRIPT = re.compile(r'<(script|style)\b.*?</\1>', re.S | re.I)
+_TABLE = re.compile(r'<table\b.*?</table>', re.S | re.I)
+_HEADING = re.compile(r'<h[1-6]\b.*?</h[1-6]>', re.S | re.I)
+_PARA = re.compile(r'<p\b[^>]*>(.*?)</p>', re.S | re.I)
+_TAG = re.compile(r'<[^>]+>')
+_STRONG_LEAD = re.compile(r'^\s*<strong[^>]*>(.*?)</strong>', re.S | re.I)
+_SENT = re.compile(r'[^.!?]*[.!?]|[^.!?]+$')
+
+# 한 문장이 끝났다고 볼 종결. 「2,700.15로」의 소수점과 구분하려면 종결어미가 필요하다.
+_ENDING = re.compile(r'(다|요|까|죠|오|네|군요|습니다|입니다)[.!?]\s*$')
+
+IMPERSONAL = ('읽힌다', '꼽힌다', '판정된다', '판정됐다', '해석된다', '풀이된다',
+              '거론된다', '관찰된다', '분석된다', '평가된다', '전망된다', '관측된다')
+TRANSLATIONESE = ('에 따른', '에 기인한', '를 통한', '을 통한', '에 의한')
+NOUN_ENDINGS = ('상태다', '모양새다', '국면이다', '상황이다', '모습이다', '분위기다')
+
+# ── 쉬운 말 ────────────────────────────────────────────────────────────────
+#
+# 2026-08-26 사용자 지시: 「브레드스 확산 트리거같은 뭔 소린지 모르는 용어 사용은
+# 자제하고 최대한 풀어서 작성해」.
+# 2026-08-28 사용자 지시로 기준을 좁혔다: 「업계용어나 경제뉴스에서 자주 나오는
+# 표현은 그냥 그대로 쓰는 걸로 하자」. 걸러야 할 것은 **외래어**가 아니라
+# **독자가 처음 보는 말**이다. 경제 뉴스를 읽는 사람이 이미 수없이 본 말까지
+# 풀어 쓰면 글이 유치해지고, 매일 걸리는 검사는 곧 무시당한다.
+#
+# 그래서 세 갈래다.
+#
+# COMMON — 시장 기사에 늘 나오는 말. 아무 제약 없이 그대로 쓴다. 검사도 안 하고
+#          겹침(JARGON_STACK)에도 안 센다. 판정 기준은 «경제 뉴스를 꾸준히 읽는
+#          사람이 여러 번 마주쳤을 말인가»이지 «한국어 대응이 있는가»가 아니다.
+# PLAIN  — 그 기준을 통과 못 하는 음차. 우리 안에서만 쓰던 말이거나 시장 기사에
+#          거의 안 나오는 말이라, 한 번만 나와도 잡고 바꿔 쓸 말을 찍어 준다.
+# GLOSS  — 뉴스에도 잘 안 나오면서 옮기면 길어지는 진짜 전문어. 쓰는 것은 되지만
+#          **첫 등장에서 한 번은** 풀어야 한다. 괄호든 「즉/다시 말해」든 형식은
+#          안 따진다.
+#
+# 낱말 하나하나보다 **한 문장에 겹쳐 쌓이는 것**이 읽기를 막는다 — 사용자가 든
+# 「브레드스 확산 트리거」가 정확히 그 형태다. JARGON_STACK이 그것을 본다.
+
+# 시장 기사에 늘 나오는 말. 검사 대상이 아니다.
+COMMON = (
+    '컨센서스', '밸류에이션', '가이던스', '멀티플', '모멘텀', '베타', '캐리',
+    '리스크온', '리스크오프', '오버웨이트', '언더웨이트', '아웃퍼폼', '언더퍼폼',
+    '익스포저', '포지셔닝', '디커플링', '스티프닝', '플래트닝', '숏커버',
+    '디레버리징', '리레이팅', '디레이팅', '오버슈팅', '기대인플레',
+    '디스인플레이션', '트리거', '스탠스',
+)
+
+PLAIN = {
+    '브레드스': '상승 종목 비율', '브레스': '상승 종목 비율', 'breadth': '상승 종목 비율',
+    '인버전': '장단기 금리 역전', '디스인버전': '금리 역전 해소',
+    '컨빅션': '확신', '프록시': '대리 지표',
+    '바텀아웃': '바닥 확인', '캐치업': '뒤따라 오름',
+    '롤다운': '만기가 짧아지며 붙는 이익',
+    # 음차가 아닌데 여기 있는 유일한 말. 통계 용어라 뜻이 정확하지만, 「96.4 백분위」를
+    # 읽고 그림이 그려지는 독자는 이 리포트가 상정한 독자가 아니다(2026-09-02 사용자
+    # 지적 — 「그렇게 쓰면 아무도 못 알아들을 것 같다」). 데이터가 `plain` 으로 옮긴
+    # 말을 내려보내므로 writer 가 옮길 일도 없다.
+    '백분위': '이보다 높았던 날은 며칠뿐',
+}
+# 뜻을 옮기면 문장이 무거워지는 것들. 첫 등장에서 한 번 풀면 그 뒤로는 그냥 쓴다.
+GLOSS = ('기간프리미엄', '확산지수', '레짐')
+# 풀이는 **그 말이 처음 나온 문장 안에서, 그 말 바로 뒤**에 있어야 한다.
+# 문단을 통째로 이어 붙여 훑으면 남의 풀이가 내 풀이로 셈된다(codex 검토 2026-08-26).
+GLOSS_WINDOW = 60
+# 풀이는 낱말 **바로 뒤**에서 시작해야 한다(`^` 고정). 멀리 떨어진 남의 괄호가
+# 이 말의 풀이로 셈되던 오탐을 막는다 — 「레짐은 유지되나 삼성전자(005930)가…」.
+# 낱말과 풀이 사이에 조사 한 덩이 정도는 허용한다.
+_GLOSS_CUE = re.compile(
+    r'^[가-힣]{0,3}\s*(?:'
+    r'\(([^)]{4,})\)|,?\s*(?:즉|다시 말해|말하자면)|'
+    r'(?:은|는|이|가)\s*(?:뜻|말)|(?:라는|이라는)\s*(?:뜻|말|의미)'
+    r')'
+)
+# 괄호 안이 수치·티커면 풀이가 아니다 — 「기간프리미엄(3.2%)」은 아무것도 안 풀었다.
+_HANGUL = re.compile(r'[가-힣]')
+MAX_JARGON_PER_SENTENCE = 1
+
+# 뒤에 뭐가 붙든 대개는 여전히 그 말이다 — 「브레드스발」·「프록시성」은 전부
+# 잡아야 맞다. 조사 목록을 허용 집합으로 두는 방식은 이것들을 놓쳤다(codex 검토).
+# 그래서 **뒤는 열어 두고**, 그 말이 아닌 합성어만 예외로 적는다. 짧고 눈으로
+# 검토되는 목록이라 새 오탐이 나오면 여기 한 줄 더한다.
+# 2026-08-28: 베타 합성어(베타테스트 등)는 「베타」가 COMMON으로 가면서 필요 없어
+# 졌고, 대신 남은 말 중 「프록시서버」가 실제 오탐이라 그쪽으로 갈았다.
+NOT_JARGON = ('프록시서버', '프록시 서버')
+
+
+def _term_pattern(term):
+    """낱말 하나를 찾는 정규식. 앞에 한글이 붙으면 다른 말로 본다.
+
+    앞을 막는 이유: 「프레짐」의 「레짐」처럼 남의 낱말 꼬리를 잡지 않으려는 것.
+    뒤를 여는 이유: 한국어는 조사·접미사가 그냥 붙어서, 뒤까지 막으면
+    「브레드스가」·「밸류에이션발」이 전부 빠져나간다.
+    """
+    if _HANGUL.search(term):
+        return re.compile(r'(?<![가-힣])%s' % re.escape(term))
+    return re.compile(r'(?<![A-Za-z])%s(?![A-Za-z])' % re.escape(term), re.I)
+
+
+def _blank_exceptions(text):
+    """그 말이 아닌 합성어를 같은 길이 공백으로 덮는다. 오프셋은 그대로."""
+    for word in NOT_JARGON:
+        text = text.replace(word, ' ' * len(word))
+    return text
+
+
+_TERM_RE = {}
+
+
+def _term_re(term):
+    if term not in _TERM_RE:
+        _TERM_RE[term] = _term_pattern(term)
+    return _TERM_RE[term]
+
+
+def _spans(text, terms):
+    """겹치지 않는 매치 목록 [(시작, 끝, 낱말)]. 긴 낱말이 이긴다.
+
+    「디스인버전」을 「인버전」까지 둘로 세면 한 낱말이 겹침 위반을 만든다.
+    """
+    hits = []
+    text = _blank_exceptions(text)
+    for term in sorted(terms, key=len, reverse=True):
+        for m in _term_re(term).finditer(text):
+            if any(m.start() < end and start < m.end() for start, end, _ in hits):
+                continue
+            hits.append((m.start(), m.end(), term))
+    return sorted(hits)
+
+
+def _count(text, term):
+    return len(_term_re(term).findall(_blank_exceptions(text)))
+
+MAX_IMPERSONAL = 2
+MAX_TRANSLATIONESE = 3
+MAX_NOMINAL_LABELS = 2
+MAX_NOUN_ENDINGS = 2
+MAX_SAME_OPENER = 4
+MAX_SAME_ENDING_RUN = 3
+
+
+# 클래스는 **토큰 단위**로 본다. 부분 문자열로 보면 `class="my-note-widget"`이
+# 각주로 빠지고, 진짜 `class="src"`는 안 빠진다(codex 검토 2026-08-26).
+# `fed-trans` 는 연준 발언의 번역이다. 충실도로 판단할 글이지 문체로 판단할 글이
+# 아니다 — 「말하듯이」 고치는 순간 의장이 하지 않은 말투가 된다.
+_META_CLASSES = frozenset((
+    'caption', 'sub', 'muted', 'footer-note', 'source', 'sources', 'src',
+    'note', 'disclaimer', 'fed-trans',
+))
+_CLASS_ATTR = re.compile(r'\bclass\s*=\s*["\']([^"\']*)["\']', re.I)
+
+
+# 뉴스 블록의 요약 문단(`expand_news_items.py` 가 채운 수집 요약). 문장을 쓴 것은 수집 단계의
+# 요약기라 작성자가 어미 반복을 고칠 수 없다. 원문 그대로인지는 뉴스 게이트가 본다(2026-09-26).
+_SUMMARY_ATTR = re.compile(r'\bdata-summary="')   # 확장기가 만드는 꼴만 면제(codex #6)
+
+
+def _is_meta_paragraph(attrs):
+    m = _CLASS_ATTR.search(attrs)
+    if not m:
+        return False
+    return any(tok.lower() in _META_CLASSES for tok in m.group(1).split())
+_PARA_WITH_ATTRS = re.compile(r'<p\b([^>]*)>(.*?)</p>', re.S | re.I)
+
+
+# 검사 밖에 두는 두 구간. 연구 판단 복기는 원장에서 생성해 바이트로 대조하는 불변 구간이라
+# 작성자가 말투를 고칠 수 없고, 근거 블록은 계산 재현용이라 코드·파일명이 제자리다.
+# 요소가 **닫히는 곳까지** 지운다 — 다음 표식까지로 자르면 남의 글을 빌린다.
+_RESEARCH_SUMMARY = re.compile(
+    r'(<section\b[^>]*\bdata-research-summary\b[^>]*>)(.*?)(</section\s*>)', re.S | re.I)
+# 구간을 통째로 빼면 가짜 `data-research-summary` 안에 산문을 숨길 수 있다. 그래서
+# `research_gate.render_summary` 가 **만드는 것만** 걷어 낸다 — 기대값을 재현하는 쪽이다.
+_GENERATED_SUMMARY_PARTS = (
+    re.compile(r'<h2>연구 판단 복기</h2>'),
+    # 옛 문형(「사전 기록·사후 기록」, 2026-10-17 전 발행본)도 걷어 낸다 — 다시 검사할 때 막히지 않게.
+    re.compile(r'<p>검토 대상 \d+건 중 (?:사전 기록 \d+건, 사후 기록|검증 시작 전에 기록한 가설 \d+건, 시작 뒤에 기록한 가설) \d+건입니다\. '
+               r'진행 중 \d+건이며 확인 기한이 지난 가설은 \d+건입니다\.</p>'),
+    re.compile(r'<p>아직 평가할 가설 기록이 없습니다\.</p>'),
+    re.compile(r'<div class="tbl-scroll"><table><thead><tr><th>가설</th>.*?</table></div>', re.S),
+)
+_PROVENANCE = re.compile(
+    r'<details\b[^>]*\bdata-provenance\b[^>]*>(.*?)</details\s*>', re.S | re.I)
+
+
+def _body(html):
+    """`<body>` 안에서 스크립트·스타일·불변 생성 구간·근거 블록을 뺀 것."""
+    m = re.search(r'<body\b', html, re.I)
+    body = html[m.start():] if m else html
+    body = _SCRIPT.sub(' ', body)
+    body = _RESEARCH_SUMMARY.sub(_strip_generated_summary, body)
+    return _PROVENANCE.sub(' ', body)
+
+
+def _strip_generated_summary(m):
+    inner = m.group(2)
+    for part in _GENERATED_SUMMARY_PARTS:
+        inner = part.sub(' ', inner, count=1)
+    return m.group(1) + inner + m.group(3)
+
+
+def _prose_html(html):
+    """산문 문단만. 표·제목·캡션은 뺀다.
+
+    표와 제목은 라벨이 짧아 개조식으로 오탐되고, 캡션·각주는 좁은 칸이라
+    줄임말이 오히려 낫다 — 쉬운 말 규칙의 대상이 아니다.
+    """
+    body = _body(html)
+    body = _TABLE.sub(' ', body)
+    body = _HEADING.sub(' ', body)
+    return [inner for attrs, inner in _PARA_WITH_ATTRS.findall(body)
+            if not _is_meta_paragraph(attrs) and not _SUMMARY_ATTR.search(attrs)]
+
+
+def _text(fragment):
+    return re.sub(r'\s+', ' ', _TAG.sub(' ', fragment)).strip()
+
+
+def sentences(text):
+    """마침표로 자르되 소수점에서는 자르지 않는다."""
+    out, buf = [], ''
+    for chunk in _SENT.findall(text):
+        buf += chunk
+        if _ENDING.search(buf) or not chunk.strip():
+            if buf.strip():
+                out.append(buf.strip())
+            buf = ''
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def _subject_josa(word):
+    """받침 있으면 「이」, 없으면 「가」. 「멀티플가」 같은 자국을 남기지 않는다."""
+    if not word:
+        return '이'
+    last = word[-1]
+    if '가' <= last <= '힣':
+        return '이' if (ord(last) - 0xAC00) % 28 else '가'
+    return '이'
+
+
+def _finding(key, count, message, level='fail'):
+    """`level` 은 'fail'(발행을 막는다) 또는 'warn'(보여 주기만 한다)."""
+    return {'key': key, 'count': count, 'message': message, 'level': level}
+
+
+def findings(html):
+    paragraphs = _prose_html(html)
+    texts = [_text(p) for p in paragraphs]
+    whole = ' '.join(texts)
+    out = []
+
+    hits = sum(whole.count(w) for w in IMPERSONAL)
+    if hits > MAX_IMPERSONAL:
+        out.append(_finding('impersonal', hits,
+                            f'비인칭 피동 종결이 {hits}회다({MAX_IMPERSONAL}회까지). '
+                            f'견해가 있으면 「~라고 볼 수 있습니다」나 능동 인과로 쓴다'))
+
+    hits = sum(whole.count(w) for w in TRANSLATIONESE)
+    if hits > MAX_TRANSLATIONESE:
+        out.append(_finding('translationese', hits,
+                            f'번역투 연결(~에 따른/~를 통한)이 {hits}회다'
+                            f'({MAX_TRANSLATIONESE}회까지). 「~해서」·「~이라」로 푼다'))
+
+    labels = 0
+    for para in paragraphs:
+        lead = _STRONG_LEAD.match(para.strip())
+        if lead and not _ENDING.search(_text(lead.group(1)) + '.'):
+            labels += 1
+    if labels > MAX_NOMINAL_LABELS:
+        out.append(_finding('nominal_label', labels,
+                            f'서술어 없는 명사형 머리말이 {labels}개다'
+                            f'({MAX_NOMINAL_LABELS}개까지). 머리말도 문장으로 쓴다'))
+
+    hits = sum(whole.count(w) for w in NOUN_ENDINGS)
+    if hits > MAX_NOUN_ENDINGS:
+        out.append(_finding('noun_ending', hits,
+                            f'「~한 상태다/모양새다」식 명사형 종결이 {hits}회다'
+                            f'({MAX_NOUN_ENDINGS}회까지). 동사로 끝낸다'))
+
+    openers = {}
+    for text in texts:
+        first = text.split()[0] if text.split() else ''
+        if first:
+            openers[first] = openers.get(first, 0) + 1
+    for word, count in openers.items():
+        if count > MAX_SAME_OPENER:
+            out.append(_finding('opener', count,
+                                f'문단이 「{word}」로 시작한 것이 {count}번이다'
+                                f'({MAX_SAME_OPENER}번까지)'))
+
+    desk = is_desk_register(html)
+    # 데스크 문서는 어미 반복을 세지 않는다(2026-11-06) — 자연스러운 문장이 네 번 「했다」로
+    # 끝나면 그대로 둔다. 반복을 없애려 「진행됐다·관측됐다」로 바꾸는 것이 더 어색하다.
+    if not desk:
+        worst = _da_run(texts)
+        if worst > MAX_SAME_ENDING_RUN:
+            out.append(_finding('monotone', worst,
+                                f'한 문단에서 「~다」로 끝나는 문장이 {worst}개 이어졌다'
+                                f'({MAX_SAME_ENDING_RUN}개까지). 종결을 섞는다'))
+
+    out += _plain_language(texts, whole, gloss=not desk)
+    if desk:
+        out += _desk_findings(html, texts)
+    return [_as_style_note(f) for f in out]
+
+
+# 발행을 막는 것은 이 셋뿐이다(2026-11-06 사용자 결정 「수치·사실·출처는 엄격하게 통제하고,
+# 문장·구성·리듬은 필자의 재량을 넓혀야 한다」). -다 위반, 독자 문장의 작업 어휘, 금리와
+# 가격을 헷갈리게 하는 「국채 급등」 — 셋 다 데스크 문서에서만 도는 검사다. 나머지 문체
+# 지적은 모든 문서에서 경고로만 보이고, 경고는 고치라는 명령이 아니라 다시 읽어 보라는
+# 표시다 — 경고를 없애려고 자연스러운 문장을 고쳐 쓰면 그것이 AI 문체를 만든다.
+# 완화는 지적을 줄이기만 하므로 교정 러너가 다시 검사하는 옛 글을 새로 막지 않는다.
+BLOCKING = frozenset({'register', 'internal', 'bond_ambiguous'})
+STYLE_NOTE = ' — 다시 읽어 보고, 자연스러우면 그대로 둔다'
+_LIMIT_NOTE = re.compile(r'\([^()]*까지[^()]*\)')
+
+
+# 줄표 뒤가 지시문인 메시지(codex 구현 검토 #3). 다른 메시지의 줄표 뒤는 관찰(예시·목록·
+# 「X → 「Y」」)이라 남긴다 — 지시문을 문형으로 가려내면 따옴표 속 예시를 함께 자른다.
+_ORDER_AFTER_DASH = frozenset({'emdash', 'hedge', 'provenance'})
+
+
+def _as_style_note(f):
+    """관찰만 남기고 재독 안내를 붙인다 — 「~한다」 지시문은 뗀다."""
+    if f['key'] in BLOCKING:
+        return f
+    # 메시지의 첫 문장이 관찰이고 그 뒤는 지시문이다(「…. 숫자로 쓴다」「…. 한 줄로 모으고 …」,
+    # codex 구현 재검토 #4). 관찰 속 예시는 한 문장 조각이라 「. 」를 품지 않는다.
+    msg = f['message'].split('. ', 1)[0]
+    msg = _LIMIT_NOTE.sub('', msg).rstrip(' .')
+    if f['key'] in _ORDER_AFTER_DASH:
+        msg = msg.rsplit(' — ', 1)[0]
+    return dict(f, level='warn', message=msg + STYLE_NOTE)
+
+
+def _da_run(texts):
+    """선언 없는 문서의 옛 규칙 — 「~다」 종결이 몇 개 이어졌나."""
+    worst = 0
+    for text in texts:
+        run = 0
+        for sentence in sentences(text):
+            tail = sentence.rstrip()[-2:]
+            if tail.startswith('다') or tail == '다.':
+                run += 1
+                worst = max(worst, run)
+            else:
+                run = 0
+    return worst
+
+
+def _same_ending_run(texts):
+    """-다 로 고정한 문서의 단조 — **같은 두 글자 종결**(했다·했다…)이 몇 개 이어졌나.
+
+    「~다 4연속 금지」를 -다 문서에 그대로 걸면 연속을 끊을 방법이 수사의문·-습니다·
+    「~죠」밖에 없다. 2026-09-23 KR 발행본의 「나머지 업종은 어땠을까?」가 그 적응이었다.
+    """
+    worst, word = 0, ''
+    for text in texts:
+        run, prev = 0, None
+        for sentence in sentences(text):
+            core = sentence.rstrip().rstrip('.!?')
+            tail = core[-2:] if len(core) >= 2 else core
+            run = run + 1 if tail == prev else 1
+            prev = tail
+            if run > worst:
+                worst, word = run, tail
+    return worst, word
+
+
+def _plain_language(texts, whole, gloss=True):
+    """쉬운 말 검사 — 음차어, 첫 등장 풀이, 한 문장 안 겹침.
+
+    `gloss=False` 는 PM 이 읽는 데스크 문서다 — 기간프리미엄·레짐을 풀어 주면 오히려
+    교과서가 된다(2026-09-23 US 「기간프리미엄(만기가 길수록 더 얹어 받는 값)」).
+    """
+    out = []
+    prose_sentences = [sent for text in texts for sent in sentences(text)]
+
+    used = [(w, _count(whole, w)) for w in PLAIN]
+    used = [(w, n) for w, n in used if n]
+    if used:
+        used.sort(key=lambda kv: -kv[1])
+        shown = ', '.join('%s(%d회) → 「%s」' % (w, n, PLAIN[w]) for w, n in used[:4])
+        more = '' if len(used) <= 4 else ' 외 %d개' % (len(used) - 4)
+        out.append(_finding('jargon', sum(n for _, n in used),
+                            '풀어 쓸 수 있는데 음차한 말이 있다 — %s%s. '
+                            '한국어로 바꿔 쓴다' % (shown, more)))
+
+    bare = [term for term in GLOSS
+            if gloss and _first_use_unglossed(prose_sentences, term)]
+    if bare:
+        out.append(_finding('jargon_gloss', len(bare),
+                            '전문어 %s%s 처음 나올 때 풀이가 없다. '
+                            '괄호나 「즉 ~」로 한 번은 뜻을 밝힌다'
+                            % ('·'.join(bare), _subject_josa(bare[-1]))))
+
+    all_terms = list(PLAIN) + (list(GLOSS) if gloss else [])
+    stacked = []
+    for sentence in prose_sentences:
+        hits = _spans(sentence, all_terms)
+        # 같은 말을 두 번 쓴 것은 겹침이 아니다. 읽기를 막는 것은 **서로 다른**
+        # 낯선 말이 쌓이는 것이다 — 「브레드스 확산 트리거」가 그 형태다.
+        distinct = list(dict.fromkeys(term for _, _, term in hits))
+        if len(distinct) > MAX_JARGON_PER_SENTENCE:
+            stacked.append((sentence, distinct))
+    if stacked:
+        sentence, terms = stacked[0]
+        out.append(_finding('jargon_stack', len(stacked),
+                            '한 문장에 낯선 말이 겹친 곳이 %d군데다 — 「%s」에 %s. '
+                            '문장을 나누거나 하나는 풀어 쓴다'
+                            % (len(stacked), sentence[:40], '·'.join(terms))))
+    return out
+
+
+def _first_use_unglossed(prose_sentences, term):
+    """그 말이 처음 나온 문장 안에서, 그 말 바로 뒤에 풀이가 있는가.
+
+    문장 밖을 보지 않는 것이 핵심이다 — 문단을 이어 붙여 훑으면 옆 낱말의
+    풀이가 이 낱말의 풀이로 셈된다(codex 검토 2026-08-26).
+    """
+    pattern = _term_re(term)
+    for raw in prose_sentences:
+        sentence = _blank_exceptions(raw)
+        match = pattern.search(sentence)
+        if not match:
+            continue
+        window = sentence[match.end():match.end() + GLOSS_WINDOW]
+        cue = _GLOSS_CUE.search(window)
+        if not cue:
+            return True
+        inner = cue.group(1)
+        # 괄호 풀이는 우리말 설명일 때만 인정한다 — 수치·티커는 푼 것이 아니다.
+        if inner is not None and not _HANGUL.search(inner):
+            return True
+        return False
+    return False
+
+
+# ── 데스크 문체 (`<body data-register="da">`) ─────────────────────────────────
+#
+# 2026-09-24 사용자 지시 「US독자는 PM으로 통일해. 어미는 다로 고정하자」. 독자가 운용자인
+# US·KR 일간·주간·월간이 이 선언을 단다(일간은 `post_shell` 이, 주간·월간은 작성자가 달고
+# `check_period` 가 확인한다). 선언이 없는 문서 — 중국 학습 리포트와 그 이전 발행본 — 는
+# 아래 검사를 받지 않는다. 교정 러너가 옛 발행본에 이 검사를 돌려도 멀쩡한 글을 막지 않는다.
+#
+# 근거: 9/23 회차 실측(내부 어휘 US 14·KR 6, KR 수사의문 5, US 어미 혼합 56/105) —
+# `docs/superpowers/specs/2026-09-24-desk-prose-design.md`.
+
+_BODY_REGISTER = re.compile(r'<body\b[^>]*\bdata-register\s*=\s*["\']da["\']', re.I)
+
+# 합쇼체·해요체 종결. -다 문서에 섞이면 한 글이 두 목소리가 된다.
+_POLITE = re.compile(r'(니다|세요|[어아해여]요|죠|지요)[.!?]?$')
+# 문장 끝의 닫는 따옴표·괄호. 「…했습니다.」·(…어땠을까?) 도 그 문장의 종결로 본다.
+_CLOSERS = '"\'」』)]’”'
+# 폭 없는 문자로 「원\u200b장」처럼 낱말을 쪼개면 화면에는 붙어 보이고 검사에서는 갈린다.
+_INVISIBLE = re.compile('[\u00ad\u200b-\u200f\u2060\ufeff]')
+
+
+def _tail(sentence):
+    return sentence.strip().rstrip(_CLOSERS).rstrip()
+MAX_POLITE = 2
+MAX_QUESTIONS = 1
+
+# 독자 문장에 나오면 안 되는 작업 어휘 — 원장·채점·수집·계산 재현은 검토 자료의 말이다.
+# 앞 글자가 한글이면 다른 낱말이다(금감원장·볼린저밴드·분위기).
+INTERNAL_PATTERNS = (
+    (r'(?<![가-힣])원장', '원장'),
+    (r'(?<![가-힣])회차', '회차'),
+    (r'기계\s*판정', '기계 판정'),
+    (r'판정\s*불가', '판정불가'),
+    (r'판단\s*불가', '판단 불가'),
+    (r'부트스트랩', '부트스트랩'),
+    (r'프로스펙티브', '프로스펙티브'),
+    (r'관측\s*창', '관측 창'),
+    (r'산출물', '산출물'),
+    (r'수집\s*(파일|분)', '수집 파일'),
+    (r'퍼센타일', '퍼센타일'),
+    (r'\d\s*분위(?!기)', 'N분위'),
+    (r'(큼|보통|미미)[»」\'"]?\s*밴드', '크기 밴드 이름'),
+    (r'python3?\b|print\(', '실행 코드'),
+    (r'\b[\w-]+\.(json|py|md)\b', '파일명'),
+    (r'(가설|질문)[을를]?\s*등록|등록을\s*보류', '가설 등록'),
+)
+_INTERNAL_RE = [(re.compile(p, re.I), label) for p, label in INTERNAL_PATTERNS]
+
+# 「국채 급등」은 국채 **가격**이 뛰었다(금리 하락)로 읽힌다. 금리를 말하려면 「금리」를 쓴다.
+_BOND_AMBIGUOUS = re.compile(r'국채\s*(급등|급락|폭등|폭락)')
+
+# 근거 블록은 계산을 재현하는 자리다. 줄글을 숨겨 검사를 비껴가는 자리가 되지 않게 묶는다.
+MAX_PROVENANCE_BLOCKS = 2
+MAX_PROVENANCE_CHARS = 600
+
+# 경고 — 발행은 막지 않는다. 한두 번은 그 문장에 맞는 표현이고, 잡으려는 것은 반복이다.
+MAX_EMDASH = 6
+HEDGES = ('가를 자료', '가를 근거', '단정하지', '단정할', '판단을 유보', '유보한다',
+          '확정하기는 이르', '쪼갤 수 없', '가리지 못', '특정할 수 없', '겹쳐 읽지')
+MAX_HEDGES = 6
+MAX_SAME_NUMBER = 3
+_NUMBER = re.compile(r'(?<![\d.,])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+)(?![\d])')
+
+# 분석 언어 — 수집 노트·원장·점검판 지시문의 말이 독자 문장에 넘어온 것(2026-10-13 사용자 비평,
+# `STYLE_EXEMPLARS.md` §10). US 10/12 본문에 후보 14·시험 12·질문 8·관측 8번.
+# **낱말이 아니라 문형을 센다** — 관측된 상관관계·관측 시각·정책금리 경로·장중 경로·일목 기준선은
+# 정상적인 시장 용어다. 연구 체계를 가리키는 꼴(「대안 쪽 관측」「금리차 경로」「기준선을 고정」)만
+# 잡고, 대선 후보·임상시험·기자 질문은 앞뒤 문맥으로 거른다. 보조 장치일 뿐 문장 품질 판정이 아니다.
+# (이름, 패턴, 앞 문맥 제외, 뒤 문맥 제외)
+RESEARCH_TERMS = (
+    ('후보', r'(?<![가-힣])후보', r'(대선|총선|경선|선거|대통령|의장|총재|위원|당)\s*$',
+     r'^\s*(등록|지명|자|토론|단일화)'),
+    ('시험', r'(?<![가-힣])시험', r'임상\s*$',
+     r'^\s*(생산|가동|발사|비행|운행|운전|양산|판매)'),
+    ('질문', r'(?<![가-힣])질문', r'(기자|의원|청문회|회견|취재진|애널리스트|시청자)\S{0,3}\s*$',
+     r'^을\s*받'),
+    ('관측', r'관측(?=되지\s*않|이\s*없|\s*기간|으로\s*둔|이\s*들어)'
+             r'|(?:새|대안\s*쪽|우리\s*쪽|상대|새\s*증거와)\s*관측', None, None),
+    ('경로', r'(?:금리차|달러|할인율|메모리|AI\s*인프라|일곱|자산별)\s*경로', None, None),
+    ('가격 근거', r'가격\s*근거', None, None),
+    ('기준선', r'기준선을\s*(?:고정|정하|정했|잡|세우|세웠)', None, None),
+)
+_RESEARCH_RE = [(label, re.compile(p), re.compile(b) if b else None, re.compile(a) if a else None)
+                for label, p, b, a in RESEARCH_TERMS]
+# 문서 길이에 따라 허용치가 는다 — 산문 2,500자마다 하나, 최소 셋. US 일간 산문은 1만~1만6천 자다.
+RESEARCH_CHARS_PER_TERM = 2500
+MIN_RESEARCH_TERMS = 3
+# 그 자리에서 지어낸 비유 — §6 의 통용되는 이름(숨고르기·전강후약)이나 금리 인상 압력·하락을 방어했다
+# 같은 정착된 표현과 달리 독자가 풀어야 하는 암호다. 목록에 있는 꼴만 잡는다(일반 비유 탐지가 아니다).
+FIGURATIVE = (
+    r'하루를\s*정(했|한|하)', r'이름표', r'시계를\s*(늘|줄|좁|넓)', r'한\s*칸\s*(올라|내려)',
+    r'신호는\s*[^.]{0,12}쪽이다', r'판단을\s*거[두둔뒀둘]', r'질문을\s*가[리린르른]',
+    r'질문은\s*[^.]{0,40}가린다',
+)
+_FIGURATIVE_RE = [re.compile(p) for p in FIGURATIVE]
+# 고유어 날수 — 「아흐레째」가 아니라 「9일째」(2026-10-13 사용자 지시). 「하루」는 그대로 둔다.
+# 보도 매체(2026-10-14 사용자 지시 「문장에 일일이 출처를 달지 말고 섹션 끝에 한번에 적어」).
+# 매체는 섹션 끝 `<p class="caption" data-sources>출처: …</p>` 한 줄로 모은다. 발언·전망·발표가
+# 곧 내용인 행위자(연준 인사·기업·은행·통계 기관)는 여기 없다 — 그들은 문장의 주어다.
+# 「닛케이」는 지수 이름과 겹쳐 뺐다(「닛케이는 0.5% 내렸다」).
+MEDIA_OUTLETS = (
+    'Reuters', '로이터', 'Bloomberg', '블룸버그', 'CNBC', 'WSJ', 'Wall Street Journal',
+    '월스트리트저널', 'Financial Times', '파이낸셜타임스', 'Newsquawk', 'MarketWatch',
+    "Barron's", 'Investing.com', 'Yahoo Finance', 'oilprice.com', 'OilPrice', 'Al Jazeera',
+    '알자지라', 'BBC', 'The Guardian', '가디언', 'Motley Fool', 'Seeking Alpha', 'Axios',
+    'Politico', 'The Information', 'Semafor', 'Fortune', 'Inman', '24/7 Wall St.', 'Kyodo', '교도통신', 'NHK', '니혼게이자이',
+    '연합뉴스', '연합인포맥스', '한국경제', '매일경제', '서울경제', '머니투데이', '이데일리',
+    '조선비즈', '뉴스1', '뉴시스', '헤럴드경제', '아시아경제', '파이낸셜뉴스', '전자신문',
+    '디지털타임스', '조선일보', '중앙일보', '동아일보', '한겨레',
+)
+# 매체 이름이 보통명사와 겹치는 것(「한국경제는 수출 회복에도 내수가 부진하다」)은 괄호 꼬리표만
+# 본다 — 주어 자리는 보도 문맥 없이 가릴 수 없다(codex 구현 검토 P3).
+AMBIGUOUS_OUTLETS = ('한국경제',)
+_OUTLET = '|'.join(re.escape(o) for o in sorted(MEDIA_OUTLETS, key=len, reverse=True))
+_OUTLET_SUBJ = '|'.join(re.escape(o) for o in sorted(MEDIA_OUTLETS, key=len, reverse=True)
+                        if o not in AMBIGUOUS_OUTLETS)
+# 「…했다(Reuters).」 꼬리표와 「로이터는 …라고 전했다」 주어. 「Reuters 보도」처럼 조사 없는
+# 명사 수식도 문장 안 출처다.
+_INLINE_MEDIA = re.compile(
+    rf'\(\s*(?:{_OUTLET})\b[^)]*\)|(?<![\w가-힣])(?:{_OUTLET_SUBJ})(?=\s*(?:는|은|이|가|에 따르면|의 보도|보도|에서)(?![가-힣]))')
+MAX_INLINE_MEDIA = 0
+
+_NATIVE_DAYS = re.compile(r'(?<![가-힣])(이틀|사흘|나흘|닷새|엿새|이레|여드레|아흐레|열흘)')
+
+
+def research_allowance(text):
+    return max(MIN_RESEARCH_TERMS, len(re.sub(r'\s', '', text)) // RESEARCH_CHARS_PER_TERM)
+
+
+# 그 문단이 선거·인터뷰·인수합병을 다루면 「후보」·「질문」은 제 뜻이다(codex 재검토 #2 — 「자민당
+# 추천 후보」, 타임 인터뷰의 「질문」, 클럽메드 인수의 다른 「후보」). 앞뒤 몇 글자로는 못 거른다.
+_PLAIN_CONTEXT = {
+    '후보': re.compile(r'선거|대선|총선|경선|총재|자민당|민주당|공화당|국민의힘|추천|공천|인수|매각|입찰|후보지'),
+    '질문': re.compile(r'인터뷰|회견|기자|청문회|취재|질의|답변|대담'),
+}
+
+
+_NEWS_ITEM = re.compile(r'<div\b[^>]*\bdata-news\b[^>]*>.*?</div\s*>', re.S | re.I)
+
+
+def _research_hits(text):
+    hits = []
+    for label, pattern, before, after in _RESEARCH_RE:
+        for m in pattern.finditer(text):
+            if before and before.search(text[max(0, m.start() - 8):m.start()]):
+                continue
+            if after and after.search(text[m.end():m.end() + 8]):
+                continue
+            ctx = _PLAIN_CONTEXT.get(label)
+            if ctx and ctx.search(text):   # 문단 단위 — 인수 이야기는 앞 문장에 있을 수 있다
+                continue
+            hits.append(label)
+    return hits
+
+
+# 판단을 자기 동사로 말했나 — 증권사 리포트 기준(2026-09-24, `STYLE_EXEMPLARS.md` §0). 전략
+# 코멘트에 하나도 없으면 판단을 「~로 보인다」로 흐렸거나 한계만 늘어놓은 것이다. 경고만 한다.
+_STRATEGY = re.compile(r'<h2\b[^>]*>\s*전략\s*코멘트\s*</h2\s*>(.*?)(?=<h2\b|$)', re.S | re.I)
+_JUDGMENT = re.compile(r'(판단한다|판단이다|(?<![켜려])본다|전망한다|예상한다|추정한다|기대한다)')
+
+
+def is_desk_register(html):
+    """`<body data-register="da">` 로 데스크 문체를 선언한 문서인가. `<body>` 태그에서만 읽는다."""
+    return bool(_BODY_REGISTER.search(html or ''))
+
+
+def _desk_findings(html, texts):
+    out = []
+    prose_sentences = [sent for text in texts for sent in sentences(text)]
+
+    polite = [s for s in prose_sentences if _POLITE.search(_tail(s))]
+    if len(polite) > MAX_POLITE:
+        out.append(_finding('register', len(polite),
+                            f'-다 로 고정한 문서에 -습니다·-죠 종결이 {len(polite)}개 섞였다'
+                            f'({MAX_POLITE}개까지) — 예: 「{polite[0][-30:]}」. 뉴스 요약도 어미를 바꿔 싣는다'))
+
+    questions = [s for s in prose_sentences if _tail(s).endswith('?')]
+    if len(questions) > MAX_QUESTIONS:
+        out.append(_finding('question', len(questions),
+                            f'묻고 답하는 문장이 {len(questions)}개다({MAX_QUESTIONS}개까지) — '
+                            f'예: 「{questions[0][-30:]}」. 답을 바로 쓴다'))
+
+    body = _body(html)
+    visible = _INVISIBLE.sub('', _text(body))
+    hits = []
+    for pattern, label in _INTERNAL_RE:
+        m = pattern.search(visible)
+        if m:
+            hits.append(f'{label}(「{visible[max(0, m.start() - 8):m.end() + 8]}」)')
+    if hits:
+        out.append(_finding('internal', len(hits),
+                            '독자 문장에 작업 어휘가 있다 — ' + ', '.join(hits[:4])
+                            + '. 계산 재현은 <details data-provenance> 로, 원장·채점 절차는 '
+                              '검토 자료로 옮기고 본문은 판단만 말한다'))
+
+    m = _BOND_AMBIGUOUS.search(visible)
+    if m:
+        out.append(_finding('bond_ambiguous', 1,
+                            f'「{m.group(0)}」은 국채 가격이 움직였다로 읽힌다 — '
+                            f'금리를 말하면 「국채금리 {m.group(1)}」으로 쓴다'))
+
+    raw = re.search(r'<body\b', html, re.I)
+    blocks = _PROVENANCE.findall(html[raw.start():] if raw else html)
+    sizes = [len(re.sub(r'\s', '', _text(b))) for b in blocks]
+    if len(blocks) > MAX_PROVENANCE_BLOCKS or any(n > MAX_PROVENANCE_CHARS for n in sizes):
+        out.append(_finding('provenance', len(blocks),
+                            f'근거 블록이 {len(blocks)}개·최대 {max(sizes)}자다'
+                            f'({MAX_PROVENANCE_BLOCKS}개·{MAX_PROVENANCE_CHARS}자까지) — '
+                            '입력·공식·결과만 둔다. 줄글은 본문으로'))
+
+    # 전략 코멘트의 판단 동사 경고는 2026-11-06 에 뺐다 — 판단은 사실과 논리 속에 드러나도
+    # 된다. 확신 수준의 구분(사실·보도·추론·가능성)은 작성 지시문이 지킨다.
+
+    whole = ' '.join(texts)
+    dashes = whole.count('—')
+    if dashes > MAX_EMDASH:
+        out.append(_finding('emdash', dashes,
+                            f'줄표(—)로 이은 곳이 {dashes}군데다({MAX_EMDASH}군데까지 권장) — '
+                            '문장을 나누거나 「~해서」·「~지만」으로 잇는다', 'warn'))
+
+    hedges = sum(whole.count(h) for h in HEDGES)
+    if hedges > MAX_HEDGES:
+        out.append(_finding('hedge', hedges,
+                            f'「가를 자료가 없다·단정하지 않는다」류 단서가 {hedges}번이다'
+                            f'({MAX_HEDGES}번까지 권장) — 한계는 그 주장 옆에 한 번, 다음 확인 자료와 '
+                            '묶어 쓰고 안 할 말은 그냥 안 한다', 'warn'))
+
+    # 기사 요약(KR `data-news` 블록)은 작성자의 분석 언어가 아니다 — 기사 속 후보·질문은 제 뜻이다.
+    own = [_text(p) for p in _prose_html(_NEWS_ITEM.sub(' ', html))]
+    research = [h for t in own for h in _research_hits(t)]
+    allowance = research_allowance(' '.join(own))
+    if len(research) > allowance:
+        tally = {}
+        for label in research:
+            tally[label] = tally.get(label, 0) + 1
+        shown = ', '.join(f'{k} {v}' for k, v in sorted(tally.items(), key=lambda kv: -kv[1]))
+        out.append(_finding('research_language', len(research),
+                            f'연구 체계 표현이 {len(research)}번이다(이 길이면 {allowance}번까지 권장) — '
+                            f'{shown}. 「반도체 후보의 가격 근거가 약해졌다」는 「반도체 업종의 상대수익률이 '
+                            '악화됐다」처럼 문맥에 맞게 다시 쓴다(STYLE_EXEMPLARS §10)', 'warn'))
+
+    figures = [m.group(0) for r in _FIGURATIVE_RE for m in r.finditer(' '.join(own))]
+    if figures:
+        out.append(_finding('figurative', len(figures),
+                            '뜻이 흐린 비유가 있다 — ' + ', '.join(f'「{f}」' for f in figures[:4])
+                            + '. 가리키는 것을 직접 쓴다(STYLE_EXEMPLARS §10-2)', 'warn'))
+
+    media = [m.group(0) for m in _INLINE_MEDIA.finditer(' '.join(own))]
+    if len(media) > MAX_INLINE_MEDIA:
+        out.append(_finding('inline_source', len(media),
+                            '문장 안에 매체 출처가 있다 — ' + ', '.join(f'「{m}」' for m in media[:4])
+                            + '. 매체는 섹션 끝 <p class="caption" data-sources>출처: …</p> 한 줄로 모으고, '
+                              '보도라는 사실만 문장에 남긴다(「~라는 보도가 나왔다」)', 'warn'))
+
+    days = [m.group(1) for m in _NATIVE_DAYS.finditer(' '.join(own))]
+    if days:
+        out.append(_finding('native_days', len(days),
+                            '날수를 고유어로 썼다 — ' + ', '.join(f'「{d}」' for d in days[:4])
+                            + '. 「9일째」·「4거래일 연속」처럼 숫자로 쓴다(「하루」는 그대로, STYLE_EXEMPLARS §10)',
+                            'warn'))
+    # 같은 수치 반복 경고는 2026-11-06 에 뺐다 — 핵심 수치는 논거라 되풀이될 수 있다.
+    return out

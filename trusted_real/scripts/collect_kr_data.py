@@ -1,0 +1,530 @@
+#!/usr/bin/env python3
+"""한국 저녁 마감 브리프 데이터 수집 엔트리.
+
+Naver(수급·거래대금·업종·테마) + yfinance(지수·섹터 멀티기간·장중)를 모아
+kr/data/*에 기록. 완성도·수급 신선도 게이트 포함. Do NOT use pykrx/키움 (spec §2).
+"""
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+
+import yfinance as yf
+
+from common import movers as movers_mod
+
+from kr import sources, flows, flows_intraday, sectors, program, stance, technical
+from kr import index_check
+from kr import econ as kr_econ
+from kr.themes import rank_themes
+from kr.etf_normalize import dropped_products, krx_changes, normalize_top_value, stock_moves
+from kr.leadership import flag_leadership
+
+KST = timezone(timedelta(hours=9))
+# themes는 2026-07-29 사용자 지시로 리포트 테마 섹션이 폐지되면서 비-코어로 강등.
+# 수집은 계속하되(재도입 대비·업종 크로스체크 참고용) 발행 게이트를 막지 않는다.
+CORE_KEYS = ("indices", "flows", "top_value", "sectors")
+# 기술적 분석 대상(일봉 차트와 동일 4종)
+TECH_SPECS = [("코스피", "^KS11"), ("코스닥", "^KQ11"),
+              ("SK하이닉스", "000660.KS"), ("삼성전자", "005930.KS")]
+
+
+INDEX_NAMES = ("KOSPI", "KOSDAQ")
+TOP_MIN_POSITIVE = 10       # 정규화 표에서 거래대금 > 0 인 행이 이보다 적으면 top_value 결측
+DASH_WARN_SHARE = 0.15      # 거래대금 `-` 비율이 이보다 크면 경고 줄(차단 아님)
+
+
+def _num(x):
+    import math
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def indices_ok(indices: dict, index_checks: dict, mode: str) -> bool:
+    """코스피·코스닥 **둘 다** 종가·등락률이 수이고 그 지수의 검증 status 가 차단이 아닐 때만 통과(2026-11-12).
+    검증 기록이 없으면 통과하지 않는다 — 검증 못 한 값을 성공으로 세지 않는다."""
+    for name in INDEX_NAMES:
+        row = (indices or {}).get(name) or {}
+        st = ((index_checks or {}).get(name) or {}).get("status")
+        if not (_num(row.get("close")) and _num(row.get("change_pct"))):
+            return False
+        if st is None or index_check.is_blocking(st, mode):
+            return False
+    return True
+
+
+def completeness(bundle: dict):
+    """코어 4종. indices 는 두 지수 모두 검증된 값이어야 한다 — 아니면 기존 토큰 "indices"(새 토큰 없음)."""
+    missing = []
+    for k in CORE_KEYS:
+        if k == "indices":
+            if not indices_ok(bundle.get("indices"), bundle.get("index_checks"),
+                              bundle.get("index_mode") or "warn"):
+                missing.append(k)
+        elif not bundle.get(k):
+            missing.append(k)
+    return (len(missing) == 0, missing)
+
+
+def _yf_last_date():
+    try:
+        df = yf.download("^KS11", period="7d", progress=False, auto_adjust=False)
+    except Exception:  # noqa: BLE001 — 네이버 거래일이 있으면 쓰이지 않는 보조 원천
+        return None
+    return df.index[-1].date().isoformat() if len(df) else None
+
+
+def guard_session(outdir, report_date, indices):
+    """늦게 돈 실행이 지난 세션을 덮어쓰지 못하게 한다 — 무엇이든 쓰기 전에 부른다.
+
+    2026-10-13 02:27 KST 실행이 10/12 종가를 10/08 로 원장·주간·월간·뉴스에 덮어썼다.
+    문제가 있으면 StaleIndexData — 이 실행의 산출물은 전부 날짜가 틀리므로 아무것도 쓰지 않는다.
+    종가 중복에는 예외가 없다 — 보합 검증으로도 풀지 않는다(`ledger_conflicts`).
+    """
+    from kr.history import StaleIndexData, index_record, ledger_conflicts
+    from us.history import read_jsonl
+    ledger = os.path.join(outdir, "history", "kr_market.jsonl")
+    rec = index_record({"report_date": report_date, "indices": indices})
+    problems = ledger_conflicts(read_jsonl(ledger), rec)
+    if problems:
+        raise StaleIndexData("; ".join(problems))
+
+
+def _check_indices(indices, prev_diffs, report_date):
+    """→ (ohlc, index_checks, mode). integration 은 지수별 독립 try — 실패하면 없음으로 본다."""
+    index_mode, config_status = index_check.load_mode()
+    ohlc = {}
+    index_checks = {"mode": index_mode, "config_status": config_status}
+    for name in INDEX_NAMES:
+        try:
+            ohlc[name] = sources.fetch_index_ohlc(name)
+        except Exception:  # noqa: BLE001 — integration 없음으로 본다
+            ohlc[name] = None
+        row = indices.get(name)
+        if row is None:
+            index_checks[name] = {"status": "fetch_error"}
+            continue
+        index_checks[name] = index_check.check_pct(row.get("close"), row.get("change_pct"), prev_diffs.get(name),
+                                                   ohlc[name], report_date, index_mode)
+    return ohlc, index_checks, index_mode
+
+
+def main(outdir: str, assetdir: str = "kr/assets"):
+    from kr.history import resolve_report_date
+    os.makedirs(outdir, exist_ok=True)
+
+    # 지수 — Naver 네이티브(수급과 일치, 마감 후 공식 종가). 거래일도 같은 응답에서 읽는다.
+    # 전일 대비(prev_diff)는 등락률 검증에만 쓴다 — kr_market_data.json 의 지수 키는 close·change_pct 그대로.
+    indices, naver_dates, prev_diffs = {}, {}, {}
+    for name, code in (("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")):
+        try:
+            row = sources.fetch_index(code)
+        except Exception as e:  # noqa: BLE001 — 그 지수만 빠진다(완결성이 막는다)
+            print(f"::warning::KR 지수 {name} 수집 실패 — {str(e)[:120]}")
+            continue
+        naver_dates[name] = row.pop("trade_date", None)
+        prev_diffs[name] = row.pop("prev_diff", None)
+        indices[name] = row
+    report_date, notes = resolve_report_date(naver_dates, _yf_last_date(),
+                                             datetime.now(KST).date().isoformat())
+    for n in notes:
+        print(f"report_date: {n}")
+    guard_session(outdir, report_date, indices)
+    bizdate = report_date.replace("-", "")
+
+    # 지수 등락률 검증 — 같은 basic 응답(C·R·D)이 1차, 보합은 integration 전일 종가로 확인. 원장은 보지 않는다.
+    # 못 읽었거나 검증하지 못한 지수는 완결성을 막는다. 계산값으로 바꾸지 않는다(2026-11-12).
+    ohlc, index_checks, index_mode = _check_indices(indices, prev_diffs, report_date)
+    for name in INDEX_NAMES:
+        ck = index_checks[name]
+        if ck["status"] not in ("ok", "ok_flat") or ck.get("cross_note"):
+            why = "차단" if index_check.is_blocking(ck["status"], index_mode) else "기록만"
+            print(f"::warning::KR {name} 등락률 검증 {ck['status']}"
+                  + (" · cross_note" if ck.get("cross_note") else "")
+                  + f" (네이버 {ck.get('naver_pct')} / 계산 {ck.get('derived_pct')}, {why}, mode={index_mode})")
+
+    # 수급 (신선도) — 코스피·코스닥. 첫 행 앞의 못 읽은 날은 그 시장을 막는다(오래된 행으로 물러서지 않는다).
+    flows_out, flow_checks = {}, {}
+    for mkt in ("KOSPI", "KOSDAQ"):
+        try:
+            walked = sources.walk_market_flows(mkt, bizdate)
+        except Exception as e:  # noqa: BLE001
+            diags = list(getattr(e, "diagnostics", []) or [])
+            flows_out[mkt] = {"rows": [], "latest_date": None, "error": str(e)[:120], "diagnostics": diags}
+            flow_checks[mkt] = {"state": "error", "faults": diags}
+            print(f"::warning::KR {mkt} 수급 수집 실패 — {str(e)[:120]}")
+            continue
+        diags = walked.get("diagnostics") or []
+        if walked.get("blocked"):
+            flows_out[mkt] = {"rows": [], "latest_date": None, "error": walked["blocked"], "blocked": True,
+                              "diagnostics": diags}
+            flow_checks[mkt] = {"state": "blocked", "faults": diags}
+            print(f"::warning::KR {mkt} 수급 막힘 — 최신 행 앞에서 못 읽은 날: "
+                  + ", ".join(f"{d['date']} {d['status']}({'/'.join(d.get('fields') or [])})" for d in diags))
+            continue
+        parsed = flows.build_market_flows(walked["rows"])
+        fresh = flows.flows_freshness(parsed["latest_date"], report_date,
+                                      provisional=(parsed["latest_date"] == report_date))
+        flows_out[mkt] = {**parsed, **fresh, "diagnostics": diags}
+        flow_checks[mkt] = {"state": "ok", "faults": diags}
+        if diags:
+            print(f"::warning::KR {mkt} 수급 일부 날짜 못 읽음(그 날만 뺌): "
+                  + ", ".join(f"{d['date']} {d['status']}" for d in diags))
+    # 두 시장 모두 있어야 코어 통과 — 한 시장만 막혀도 발행 멈춤(KR_ORCHESTRATOR 「코어 표에 구멍이 있으면 중단」)
+    flows_ok = all(flows_out.get(m, {}).get("latest_date") for m in ("KOSPI", "KOSDAQ"))
+
+    # 장중 수급 궤적 (누적 순매수 스냅샷 → 30분 앵커·극값·부호 전환) — 비-코어.
+    # 확정 수치가 아니다: 정규장 마지막값과 일별 확정치는 정정 때문에 갈린다.
+    intraday_flows = {"unit": "억원", "date": report_date,
+                      "basis": "장중 누적 순매수 스냅샷 — 확정 일별 수치와 다를 수 있음"}
+    for mkt, sosok in (("KOSPI", "01"), ("KOSDAQ", "02")):
+        try:
+            rows = flows_intraday.collect_pages(
+                lambda pg, s=sosok: flows_intraday.parse_intraday_flows(
+                    sources.fetch_intraday_flows(s, bizdate, pg)))
+            series = flows_intraday.build_series(rows)
+            # 일별 수급이 전 거래일 기준이면 장중 궤적도 당일이라 부르지 않는다.
+            series["stale"] = bool(flows_out.get(mkt, {}).get("stale"))
+            intraday_flows[mkt] = series
+        except Exception as e:
+            intraday_flows[mkt] = {"points": [], "error": str(e)[:120]}
+    intraday_flows_ok = any((intraday_flows.get(m) or {}).get("points")
+                            for m in ("KOSPI", "KOSDAQ"))
+
+    # 프로그램 매매 (차익·비차익·전체 순매수, 억원) — 비-코어, 신선도는 flows와 동일 판정
+    program_out = {}
+    for mkt, sosok in (("KOSPI", "01"), ("KOSDAQ", "02")):
+        try:
+            parsed = program.parse_program_flows(sources.fetch_program_flows(sosok, bizdate))
+            fresh = flows.flows_freshness(parsed["latest_date"], report_date,
+                                          provisional=(parsed["latest_date"] == report_date))
+            program_out[mkt] = {**parsed, **fresh}
+        except Exception as e:
+            program_out[mkt] = {"rows": [], "latest_date": None, "error": str(e)[:120]}
+
+    # 기술적 지표 (이평 20/60/120·볼린저 20±2σ·일목 9/26/52) — 4종, 비-코어
+    technical_out = {}
+    for name, tk in TECH_SPECS:
+        try:
+            tdf = yf.download(tk, period="2y", progress=False, auto_adjust=False)
+            if hasattr(tdf.columns, "nlevels") and tdf.columns.nlevels > 1:
+                tdf.columns = tdf.columns.get_level_values(0)
+            if len(tdf):
+                technical_out[name] = technical.compute_technical(tdf)
+        except Exception as e:
+            technical_out[name] = {"error": str(e)[:120]}
+
+    # 거래대금 상위 (ETF 정규화) — 단위 백만원
+    # 지수·해외 ETF 는 상위 표에서 빠지지만(2026-07-29) 실행 조건의 유동성 근거로는
+    # 필요하다 — 같은 raw 에서 갈라 따로 쓴다. 비-코어.
+    index_etf, candidates = [], []
+    try:
+        raw_top, top_stats = sources.fetch_top_value_stats("0")
+        top_value = normalize_top_value(raw_top, top_n=10)
+        index_etf = dropped_products(raw_top)
+        candidates = stock_moves(raw_top)
+        positive = sum(1 for r in top_value if (r.get("value") or 0) > 0)
+        top_check = {**top_stats, "positive_rows": positive}
+        if positive < TOP_MIN_POSITIVE:
+            # 0원 행이 표를 채우는 경우를 막는다 — 표 전체를 결측으로(2026-11-12)
+            print(f"::warning::KR 거래대금 상위 표의 양수 행 {positive}개 < {TOP_MIN_POSITIVE} — top_value 결측")
+            top_value = []
+        if top_stats.get("rows") and top_stats.get("dash", 0) > top_stats["rows"] * DASH_WARN_SHARE:
+            print(f"::warning::KR 거래대금 빈 값(-) {top_stats['dash']}/{top_stats['rows']}행 — "
+                  "15% 초과, 부분 장애일 수 있다(차단 아님)")
+    except Exception as e:
+        # 빈 결과도 예외로 올라온다 — 조용한 [] 가 2026-09-10~09-21 발행을 막았다.
+        print(f"top_value failed: {e}", file=sys.stderr)
+        print(f"::warning::KR 거래대금 수집 실패 — {str(e)[:120]}")
+        top_value = []
+        top_check = {"error": str(e)[:200]}
+
+    # 개별주 등락 — KRX 종가 기준(yfinance). 네이버 등락은 넥스트레이드 통합가라 쓰지 않는다. 비-코어.
+    moves = []
+    try:
+        if candidates:
+            tickers = [f'{c["code"]}.KS' for c in candidates]
+            closes_df = yf.download(tickers, period="7d", progress=False, auto_adjust=False)["Close"]
+            closes = {}
+            for c in candidates:
+                tk = f'{c["code"]}.KS'
+                if tk in getattr(closes_df, "columns", []):
+                    col = closes_df[tk].dropna()
+                    closes[c["code"]] = [(i.date().isoformat(), float(v)) for i, v in col.items()]
+            moves = krx_changes(candidates, closes, report_date)
+    except Exception as e:
+        print(f"stock_moves failed: {e}", file=sys.stderr)
+        moves = []
+
+    # 섹터 멀티기간 수익률 (대표 ETF, yfinance) — 바 차트용
+    sector_rows = []
+    try:
+        pairs = list(sectors.SECTOR_ETFS.items())
+        batch = yf.download([tk for _, tk in pairs], period="2y",
+                            progress=False, auto_adjust=False)["Close"]
+        for name, tk in pairs:
+            if tk not in getattr(batch, "columns", []):
+                continue
+            sector_rows.append({"name": name, "ret": sectors.multi_horizon_returns(batch[tk])})
+    except Exception:
+        sector_rows = []
+    sector_html = sectors.render_sector_html(sector_rows) if sector_rows else ""
+
+    # 업종 1D 주도 크로스체크 (등락률 ∧ breadth) — Naver 업종 유니버스
+    industry = []
+    try:
+        industry = flag_leadership(sources.fetch_industry(),
+                                   ret_key="change_pct", value_key="breadth",
+                                   strong_note="폭넓은 상승 주도", weak_note="좁은 상승·개별종목")
+    except Exception:
+        industry = []
+
+    # 움직인 종목 — 지수 기여 상·하위 2 + |등락| ≥ 5% 를 업종·방향으로 묶어 최대 5묶음.
+    # 리서치가 묶음마다 「왜」를 찾는다(2026-09-24). 업종은 후보만 조회한다. 비-코어.
+    kr_movers = {"report_date": report_date, "groups": []}
+    try:
+        caps = {r["name"]: r.get("cap") or 0 for r in raw_top} if candidates else {}
+        codes = {c["name"]: c["code"] for c in candidates}
+        rows = [dict(m, cap=caps.get(m["name"], 0)) for m in moves]
+        names = sources.fetch_industry_names()
+        picked = {c["name"] for c in movers_mod.select_candidates(rows)}
+        industries = {}
+        for name in picked:
+            try:
+                no = sources.fetch_stock_industry(codes[name])
+            except Exception:
+                no = None
+            industries[name] = names.get(no) if no else None
+        kr_movers = movers_mod.build(report_date, "코스피 거래대금 상위 60 개별주(KRX 종가)",
+                                     rows, industries)
+    except Exception as e:
+        print(f"movers failed: {e}", file=sys.stderr)
+        kr_movers = {"report_date": report_date, "groups": [], "error": str(e)[:200]}
+
+    # 테마 랭킹
+    try:
+        theme_rows = rank_themes(sources.fetch_themes(7), top=15)
+    except Exception:
+        theme_rows = []
+
+    # 장중 30분봉 (Naver 분봉 다운샘플) + 당일 OHLC — 코스닥은 수급 차트 우축에도 쓴다
+    intraday = {}
+    for code in ("KOSPI", "KOSDAQ"):
+        try:
+            intraday[code] = sources.fetch_intraday(code)
+            # 위 등락률 검증에서 받은 integration 을 다시 쓴다. flow_bizdate 는 싣지 않는다(기존 계약)
+            if ohlc.get(code) is not None:
+                intraday[f"{code}_ohlc"] = {k: v for k, v in ohlc[code].items() if k != "flow_bizdate"}
+        except Exception:
+            pass
+
+    # 차트 2종 → `kr/assets/{종류}_{거래일}.png`.
+    # 무날짜 한 이름으로 쓰던 판은 매일 덮어써졌고, 그래서 발행본이 차트를 base64 로
+    # 안고 가야 했다(발행 HTML 의 91%가 그 바이트였다). 날짜를 파일명에 넣어 그 이유를
+    # 없앤다. 어느 차트가 실제로 만들어졌는지는 매니페스트가 적는다 — 조용히 빠지면
+    # writer 가 이름을 조립해 없는 파일을 가리킨다.
+    from kr import charts as _charts
+    produced = {}
+    for kind, render in (("kr_charts", lambda: _charts.render_daily_charts(TECH_SPECS)),
+                         ("kr_flows_intraday",
+                          lambda: _charts.render_intraday_flow_chart(intraday_flows, intraday))):
+        try:
+            produced[kind] = render()
+        except Exception:  # noqa: BLE001 — 차트는 비-코어다. 없으면 그 블록만 빠진다
+            produced[kind] = None
+    # 충돌·쓰기 실패는 매니페스트에 적고 수집은 계속한다 — 차트는 비-코어다.
+    produced, notes = _charts.publish_all(assetdir, report_date, produced)
+    _write(outdir, "kr_charts_manifest.json",
+           _charts.manifest(produced, report_date, notes))
+
+    bundle = {"report_date": report_date, "indices": indices,
+              "index_checks": index_checks, "index_mode": index_mode,
+              "flows": flows_out if flows_ok else None,
+              "top_value": top_value, "sectors": sector_rows, "themes": theme_rows}
+    ok, missing = completeness(bundle)
+
+    # 경제지표: ECOS(국고채·기준금리·단기금리). 비-코어 — 실패해도 발행을 막지 않는다.
+    econ = kr_econ.collect()
+    if econ.get("pending") or econ.get("missing"):
+        if "econ" not in missing:
+            missing.append("econ")
+    if not intraday_flows_ok:
+        missing.append("flows_intraday")
+
+    market = {"report_date": report_date, "complete": ok, "missing": missing,
+              "indices": indices,
+              "flows_date": {m: v.get("flows_date") for m, v in flows_out.items()},
+              "flows_provisional": {m: v.get("flows_provisional") for m, v in flows_out.items()},
+              # 검사 기록 — 작성자는 본문에 옮기지 않는다. 판 관리 manifest 가 이 사본을 남긴다(2026-11-12)
+              "checks": {"index_pct": index_checks, "flows": flow_checks, "top_value": top_check}}
+
+    _write(outdir, "kr_market_data.json", market)
+    _write(outdir, "kr_flows.json", flows_out)
+    _write(outdir, "kr_flows_intraday.json", intraday_flows)
+    _write(outdir, "kr_program.json", program_out)
+    _write(outdir, "kr_technical.json", technical_out)
+    _write(outdir, "kr_top_value.json", top_value)
+    _write(outdir, "kr_index_etf.json", index_etf)
+    _write(outdir, "kr_stock_moves.json", moves)
+    _write(outdir, "kr_movers.json", kr_movers)
+    _write(outdir, "kr_industry.json", industry)
+    _write(outdir, "kr_theme.json", theme_rows)
+    _write(outdir, "kr_intraday.json", intraday)
+    _write(outdir, "kr_econ.json", econ)
+
+    # 판단 원장 판정 — 어제 적어 둔 무효화 레벨을 오늘 종가로 검산한다. 비-코어.
+    # 원장이 없으면 「판정불가」로 남고, 그게 첫 회차의 정상 상태다(부트스트랩).
+    prior = None
+    prior_path = os.path.join(outdir, "kr_stance.json")
+    if os.path.exists(prior_path):
+        try:
+            with open(prior_path, encoding="utf-8") as fh:
+                prior = json.load(fh)
+        except Exception as e:  # noqa: BLE001 — 깨진 원장이 수집을 막지 않는다
+            print(f"kr_stance.json 읽기 실패: {e}", file=sys.stderr)
+    stance_eval = stance.evaluate(prior, indices)
+    _write(outdir, "kr_stance_eval.json", stance_eval)
+    print(f"stance: {stance_eval['verdict']} — {stance_eval['note']}")
+
+    # 기간 집계 — 세션 upsert. 과거 확정 수급 행도 함께 메워 주간이 자가치유된다.
+    # 양쪽 시장 모두 시세를 다시 받지 않는다. US 는 data/history/market.jsonl 을 굴리고,
+    # KR 은 업종·거래대금에 과거 계열이 없어 그날 스냅샷을 날짜 키로 쌓는다.
+    try:
+        from kr.history import index_record, index_series, merge_index_record
+        from kr.period import finalize, session_from, upsert_session
+        from us.history import append_jsonl, read_jsonl
+        from us.period import week_key
+
+        sess = session_from(market, flows_out, industry, top_value)
+
+        # 지수 종가는 다시 받지 않는다 — 그날 발행본이 인쇄한 값을 원장에 쌓고 그것만 읽는다.
+        ledger = os.path.join(outdir, "history", "kr_market.jsonl")
+        # 같은 날 재수집이 못 읽은 지수의 기존 종가를 지우지 않는다(발행 여부는 보지 않는다 — 동결은 versions.py)
+        old = next((r for r in read_jsonl(ledger) if r.get("report_date") == report_date), None)
+        if append_jsonl(ledger, merge_index_record(old, index_record(market)), upsert=True):
+            print(f"history: appended {report_date} to kr_market.jsonl")
+        closes = index_series(read_jsonl(ledger))
+
+        for span, keyer, sub in (("weekly", week_key, "weekly"),):
+            k = keyer(report_date)
+            d = os.path.join(outdir, sub)
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"{k}.json")
+            agg = {"span": span, "key": k, "sessions": {}}
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as fh:
+                    agg["sessions"] = (json.load(fh).get("_sessions") or {})
+            agg = upsert_session(agg, sess)
+            # 과거 확정 수급 행 — 같은 기간에 속하는 것만 메운다
+            for ed, mkts in (sess.get("extra_flows") or {}).items():
+                if keyer(ed) == k:
+                    prior = dict(agg["sessions"].get(ed) or {})
+                    prior_flows = dict(prior.get("flows") or {})
+                    prior_flows.update(mkts)
+                    prior.pop("flows", None)
+                    agg = upsert_session(agg, {"date": ed, **prior, "flows": prior_flows})
+            final = finalize(agg, closes)
+            final["_sessions"] = agg["sessions"]     # 다음 실행이 이어 쓸 원장
+            _write(d, f"{k}.json", final)
+            print(f"kr {span} {k}: {final['sessions']} sessions, "
+                  f"flows {final['flows_sessions']}일")
+    except Exception as e:
+        print(f"kr period aggregation failed: {e}", file=sys.stderr)
+    with open(os.path.join(outdir, "kr_sector.html"), "w", encoding="utf-8") as f:
+        f.write(sector_html)
+
+    # 「오늘의 장」 재료. 비-코어 — 실패해도 나머지 산출물은 나간다.
+    session_ctx = None
+    try:
+        from kr import session as kr_session
+        md = None
+        for cand in ("data/market_data.json", "../data/market_data.json"):
+            if os.path.exists(cand):
+                with open(cand, encoding="utf-8") as f:
+                    md = json.load(f)
+                break
+
+        fut = {}
+        for _, t in kr_session.FUTURES:
+            try:
+                h = yf.Ticker(t).history(period="5d", interval="30m")
+                if h is not None and len(h):
+                    h.index = h.index.tz_convert("America/New_York")
+                    fut[t] = [{"t": i.isoformat(), "close": float(r["Close"])}
+                              for i, r in h.iterrows()]
+            except Exception:
+                pass
+
+        peers = {}
+        for name, t in kr_session.PEERS:
+            try:
+                c = yf.Ticker(t).history(period="10d")["Close"].dropna()
+                if len(c) >= 2:
+                    peers[name] = (float(c.iloc[-1] / c.iloc[-2] - 1) * 100,
+                                   str(c.index[-1].date()))
+            except Exception:
+                pass
+
+        fx_bars = []
+        try:
+            h = yf.Ticker("KRW=X").history(period="5d", interval="30m")
+            if h is not None and len(h):
+                fx_bars = [{"t": i.isoformat(), "high": float(r["High"]),
+                            "low": float(r["Low"]), "close": float(r["Close"])}
+                           for i, r in h.iterrows()]
+        except Exception:
+            pass
+
+        kospi_pct = (indices.get("KOSPI") or {}).get("change_pct")
+        session_ctx = {
+            "report_date": report_date,
+            "us_prev": kr_session.us_prev(md, report_date),
+            "us_futures_during_kr": {
+                lab: kr_session.kr_hours_window(fut.get(t), report_date)
+                for lab, t in kr_session.FUTURES},
+            "asia_peers": kr_session.asia_peers(peers, kospi_pct),
+            "usdkrw_intraday": kr_session.usdkrw_window(fx_bars, report_date),
+        }
+        _write(outdir, "kr_session.json", session_ctx)
+        print(f"session: 아시아 {len(peers)}종 / 미국 선물 {len(fut)}종")
+    except Exception as e:
+        print(f"kr session failed: {e}")
+
+    # 펀드 참고 블록 — 같은 실행의 메모리 객체로만 조립한다(새 요청 없음). 비-코어:
+    # JSON 은 늘 쓰고, 그릴 수 없는 날은 HTML 을 지운다.
+    from fund import publish as fund_publish
+    generated = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M KST")
+    try:
+        from fund import kr_view
+        view = kr_view.build(report_date, session_ctx, econ, industry, moves, generated)
+        fund_publish.write(outdir, "kr_fund_view.json", "kr_fund_view.html", view,
+                           kr_view.html(view))
+        print(f"fund view: {view['status']} · 관측 {len(view['observations'])}건"
+              + (f" · missing {view['missing']}" if view["missing"] else ""))
+    except Exception as e:
+        print(f"fund view failed: {e}", file=sys.stderr)
+        fund_publish.write(outdir, "kr_fund_view.json", "kr_fund_view.html",
+                           fund_publish.failed(report_date, generated, e), None)
+
+    print(f"report_date={report_date} complete={ok} missing={missing} "
+          f"flows_date={market['flows_date']}")
+
+
+def _write(outdir, name, obj):
+    with open(os.path.join(outdir, name), "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--outdir", default="kr/data")
+    ap.add_argument("--assetdir", default="kr/assets",
+                    help="날짜별 차트 PNG 를 내보낼 곳. 발행본이 ../assets/ 로 참조한다")
+    args = ap.parse_args()
+    from kr.history import StaleIndexData
+    try:
+        main(args.outdir, args.assetdir)
+    except StaleIndexData as e:
+        # 실패로 끝내야 워크플로가 커밋하지 않는다. 다음 슬롯·다음 날 수집이 정상으로 이어 간다.
+        print(f"수집 중단 — 날짜가 틀린 세션: {e}", file=sys.stderr)
+        sys.exit(2)

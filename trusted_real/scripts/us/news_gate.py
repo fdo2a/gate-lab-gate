@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""뉴스 섹션 발행 게이트 — 실재하지 않는 기사를 막는다.
+
+이 섹션이 스크립트 수집으로 설계된 이유가 여기 있다(`us/news.py` 참조). 에이전트가
+검색해 적은 뉴스는 사후에 확인할 방법이 없지만, 수집분이 파일로 남으면 **발행본이
+인용한 기사가 그날 실제로 받아진 것인지** 대조할 수 있다.
+
+막는 실패는 넷이다.
+
+  · 수집되지 않은 기사 — 그럴듯한 헤드라인을 지어내 쓰는 것
+  · 요약이 없는 기사 — 제목만 보고 300자를 쓰면 그건 요약이 아니라 창작이다
+    (2026-09-24 부터 요약은 Actions 가 본문을 읽고 만든 `summary_ko` 다)
+  · RSS 한 줄 요약을 옮긴 것 — 사용자가 「한줄 요약은 좀 짧다」고 한 바로 그것
+  · 지어낸 링크 — `source_gate` 와 같은 규율. 링크는 그 블록이 근거로 삼은 기사여야 한다
+
+**요약 충실도 (2026-09-24).** 요약은 이제 수집 잡이 원문을 읽고 만든 `summary_ko` 로
+커밋된다. 발행 블록은 그 요약에서 크게 벗어날 수 없다 — 글자 단위 유사도가
+`MIN_SIMILARITY` 미만이면 막는다. 문장을 다듬는 것(윤문)은 통과하고, 실제 guid 를 달고
+다른 내용을 쓰는 것은 걸린다. 아래 문단은 그 전의 한계 기록이다.
+
+**이 게이트가 증명하지 못하는 것**(2026-09-19 codex 검토 #9). 표식이 가리키는 기사가
+그날 실제로 받아졌다는 것까지가 한계다. **요약이 그 기사에 충실한지는 검사하지 않는다** —
+실제 guid 를 달고 전혀 다른 내용을 300자 쓰면 통과한다. 한국어 요약과 영문 원문을 기계로
+대조할 방법이 없기 때문이고, 그 자리는 작성 계약과 사후 검토 게이트가 맡는다. 설계 설명에
+「지어낸 헤드라인을 막는다」고 쓰더라도 **막는 것은 존재하지 않는 기사이지 부정확한 요약이
+아니다** — 이 구분을 흐리면 검사받지 않은 것을 검사받았다고 믿게 된다.
+
+**구조를 정규식으로 읽지 않는다** (2026-09-19 codex 2차 검토). 1차 수정은 정규식으로
+`<div>` 깊이를 셌는데, 2차에서 속성값의 `</section>`·script 문자열의 `</div>`·
+작은따옴표 속성·`<section hidden>` 조상·`&nbsp;` 패딩이 줄줄이 뚫렸다. 정규식을 한 겹씩
+덧대는 동안 매번 새 우회로가 나왔다 — **표준 라이브러리 파서가 이 싸움의 정답이다.**
+`html.parser` 는 따옴표·텍스트 문맥·속성을 스스로 가르므로 그 부류가 통째로 닫힌다.
+
+비-코어다. 피드가 죽어 수집분이 비면 **섹션을 실을 의무**는 면제된다. 다만 **실은 것을
+대조받을 의무는 면제되지 않는다**(1차 #1) — 수집이 실패한 날이 지어낸 뉴스가 실릴 확률이
+가장 높은 날이다.
+
+Pure — `check()` 는 문자열과 dict 를 받아 위반 메시지 목록을 돌려준다.
+"""
+
+import re
+from difflib import SequenceMatcher
+from html.parser import HTMLParser
+
+from .news import DIGEST_CATEGORIES
+from .news_summary import cjk_runs, self_correction, summary_problem
+
+TITLE = '오늘의 뉴스'
+
+# 한 항목 300자(2026-09-19 사용자 지시). 밴드로 두는 이유 — 정확히 300자를 요구하면
+# 마지막 문장이 분량에 맞춰 잘리거나 늘어난다. 하한은 「RSS 요약을 옮긴 것」을 걸러 내는
+# 값이고(영어 description 중앙값 136자 → 한국어 80~100자), 상한은 한 항목이 섹션을
+# 삼키는 것을 막는 값이다. 상한 420 → 530(2026-11-08 사용자 「상한 올리기」) = 수집이 받아 주는 요약
+# 상한(news_summary.BAND_MAX 450) + 연결 문장(news_expand.LINK_MAX 80). 목표 분량(270-370자)은 그대로다.
+MIN_CHARS = 240
+MAX_CHARS = 530
+
+# 뉴스 섹션 안에서 표식 없이 흐르는 산문의 허용치. `<article>`·`<li>` 로 갈아입으면
+# 블록 검사를 통째로 비껴갔다(1차 #10). 제목·표·캡션은 조판이므로 세지 않는다(2차 #8b).
+STRAY_MAX = 200
+
+# 발행 블록 ↔ 수집 요약(`summary_ko`)의 글자 유사도 하한. 2026-09-24 테스트 표본에서
+# 어미·동사 몇 개를 바꾼 윤문은 0.97, 실제 guid 아래 다른 기사 내용을 쓴 것은 0.20 이었다.
+# 윤문이 문장 순서까지 흔드는 경우를 위해 여유를 크게 둔다.
+MIN_SIMILARITY = 0.5
+# 블록 글자 중 요약과 겹치는 몫의 하한. 유사도는 대칭이라 「요약 전문 + 지어낸 수치 50자」가
+# 0.89 로 통과했다(2026-09-24 구현 검토). 작성 계약이 허용하는 것은 시세 연결 한 문장뿐이다 —
+# 표본에서 그 한 문장(22자)은 0.93, 지어낸 수치 문장(59자)을 붙인 것은 0.81 이었다. 요약 270자
+# 기준으로 45자 안팎까지 덧붙일 수 있는 선이다.
+MIN_COVERAGE = 0.85
+
+# 분량에서 빼는 것 — 제목 줄과 캡션을 늘려 하한을 채우는 우회를 막는다.
+_SKIP_CLASSES = ('news-head', 'caption', 'sub')
+_SKIP_TAGS = ('script', 'style', 'template', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+              'table', 'figcaption')
+# 눈에 안 보이게 만드는 방법은 display·visibility 말고도 많다. 2026-09-24 구현 검토에서
+# `<span style="font-size:0">{summary_ko}</span>` 한 줄이 분량·유사도 검사를 둘 다 통과했다.
+_HIDDEN_STYLE = re.compile(
+    r'display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![.\d]*[1-9])|'
+    r'opacity\s*:\s*0(?:\.0*)?\s*(?:;|$)|color\s*:\s*transparent|'
+    r'clip(?:-path)?\s*:|text-indent\s*:\s*-|(?:max-)?(?:height|width)\s*:\s*0(?:px)?\s*(?:;|$)',
+    re.I)
+_HIDDEN_CLASSES = ('sr-only', 'visually-hidden', 'screen-reader-text')
+
+
+def _is_hidden(attrs):
+    if 'hidden' in attrs or (attrs.get('aria-hidden') or '').lower() == 'true':
+        return True
+    if any(c in (attrs.get('class') or '').split() for c in _HIDDEN_CLASSES):
+        return True
+    return bool(_HIDDEN_STYLE.search(attrs.get('style') or ''))
+
+
+def _is_item(attrs):
+    return 'data-news' in attrs or 'news-item' in (attrs.get('class') or '')
+
+
+class _Reader(HTMLParser):
+    """문서를 한 번 훑어 뉴스 블록과 그 안에서 독자가 보는 글자를 모은다.
+
+    `convert_charrefs` 기본값이 엔티티를 풀어 주므로 `&nbsp;`·`&#44032;` 패딩이
+    저절로 잡힌다(2차 #7). 스택은 **모든 요소**를 타므로 `<section hidden>` 같은
+    div 아닌 조상의 숨김도 전파된다(2차 #5).
+    """
+
+    def __init__(self, title=TITLE):
+        super().__init__(convert_charrefs=True)
+        self.title = title
+        self.stack = []          # [(tag, hidden, skip, item_or_None)]
+        self.items = []          # [{'guid', 'chars', 'links', 'hidden'}]
+        self.section = None      # 「오늘의 뉴스」 구간에서 모은 것
+        self._in_title = False
+        self._title = ''
+        self._title_depth = 0
+        self.section_depth = None
+        self.section_items = []
+        self.section_stray = 0
+        self.section_stray_text = ''
+
+    # ── 구조 ──────────────────────────────────────────────────────────
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or '') for k, v in attrs}
+        parent = self.stack[-1] if self.stack else None
+        hidden = (parent[1] if parent else False) or _is_hidden(a)
+        # 클래스는 토큰으로 맞춘다 — 부분 문자열이면 `subject`·`subtitle` 본문이 `sub` 로 빠졌다(codex 2026-10-18 #2)
+        skip = (parent[2] if parent else False) or tag in _SKIP_TAGS or any(
+            c in (a.get('class') or '').split() for c in _SKIP_CLASSES)
+        item = parent[3] if parent else None
+        if _is_item(a) and item is None:
+            item = {'guid': a.get('data-news'), 'chars': 0, 'text': '', 'links': [],
+                    'hidden': hidden, 'in_section': self.section_depth is not None}
+            self.items.append(item)
+            if self.section_depth is not None:
+                self.section_items.append(item)
+        if tag in ('h2', 'h3') and self.section_depth is None:
+            self._in_title, self._title = True, ''
+            self._title_depth = len(self.stack)
+        if tag == 'a' and item is not None and not hidden:
+            item['links'].append(a.get('href') or '')
+        if tag not in ('br', 'img', 'hr', 'meta', 'link', 'input'):
+            self.stack.append((tag, hidden, skip, item))
+
+    def handle_endtag(self, tag):
+        idx = None
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                idx = i
+                break
+        if tag in ('h2', 'h3'):
+            self._in_title = False
+            if self._title.strip() == self.title and self.section_depth is None:
+                # 구간은 **제목을 담은 요소**부터 그 요소가 닫힐 때까지다.
+                # 제목 자신의 깊이를 잡으면 바로 다음 줄에서 지워진다.
+                self.section_depth = max(self._title_depth - 1, 0)
+            self._title = ''
+        if idx is None:
+            return
+        if self.section_depth is not None and idx <= self.section_depth:
+            self.section_depth = None
+        del self.stack[idx:]
+
+    def handle_data(self, data):
+        if self._in_title:
+            self._title += data
+        text = re.sub(r'\s+', '', data)
+        if not text:
+            return
+        top = self.stack[-1] if self.stack else None
+        if top is None:
+            return
+        _, hidden, skip, item = top
+        if hidden or skip:
+            return
+        if item is not None:
+            item['chars'] += len(text)
+            item['text'] += text
+        elif self.section_depth is not None:
+            self.section_stray += len(text)
+            self.section_stray_text += text
+
+
+def _read(html, title=TITLE):
+    r = _Reader(title)
+    try:
+        r.feed(html or '')
+        r.close()
+    except Exception:
+        pass                      # 조판이 깨진 날에도 모은 데까지 쓴다
+    return r
+
+
+def check(html, collected, report_date=None, categories=DIGEST_CATEGORIES, title=TITLE,
+          floor=None):
+    """-> 위반 메시지 목록. 빈 목록이면 통과.
+
+    `floor` = (갈래 묶음, 하한) — KR 뉴스(2026-11-05, 「각각 최소 3개씩」). 그 갈래에 실을 수 있는
+    기사가 하한 이상 있는데 실은 것이 하한보다 적으면 위반이다. 수집분이 모자란 날은 있는 만큼이면 된다 —
+    다른 날짜나 기억으로 채우지 않는다.
+
+    `categories` 는 섹션 의무를 거는 갈래 — US 는 `us.news`, KR 은 `kr.news` 의
+    `DIGEST_CATEGORIES`(2026-09-24). 나머지 검사는 시장과 무관하다.
+    `title` 은 섹션 제목 — 일본 주간은 「이번 주 뉴스」(2026-10-18).
+    """
+    items = (collected or {}).get('items') or []
+    # guid 는 **매체 안에서만** 고유하다 — 게이트도 수집기와 같은 범위를 써야
+    # 한쪽에서 가른 것이 다른 쪽에서 합쳐지지 않는다(2차 #9).
+    known = {}
+    for it in items:
+        known.setdefault(_key(it.get('source'), it.get('guid')), it)
+        known.setdefault(_key(None, it.get('guid')), it)
+
+    v = []
+    got = (collected or {}).get('report_date')
+    if items and report_date:
+        if not got:
+            v.append('수집분에 report_date 가 없다 — 오늘 것인지 확인할 수 없다')
+        elif got != report_date:
+            v.append(f'수집분이 {got} 자다 — 오늘({report_date}) 발행본의 '
+                     f'근거가 될 수 없다')
+
+    doc = _read(html, title)
+    hidden = [it for it in doc.items if it['hidden']]
+    if hidden:
+        v.append(f'숨겨진 뉴스 블록 {len(hidden)}개 — 독자가 보지 못하는 항목은 '
+                 f'실은 것으로 치지 않는다')
+
+    visible = [it for it in doc.items if not it['hidden']]
+    unmarked = sum(1 for it in visible if not it['guid'])
+    if unmarked:
+        v.append(f'`data-news` 가 없는 뉴스 블록 {unmarked}개 — 표식 없는 항목은 '
+                 f'수집분과 대조할 수 없다')
+
+    seen = set()
+    for it in visible:
+        guid = it['guid']
+        if not guid:
+            continue
+        if guid in seen:
+            v.append(f'같은 기사를 두 번 실었다 (중복 `data-news="{guid}"`)')
+            continue
+        seen.add(guid)
+        v.extend(_check_one(guid, it, known))
+        v.extend(_leaks(f'`data-news="{guid}"` 블록', it['text']))
+
+    from us.news_expand import summary_violations
+    v.extend(summary_violations(html, collected))
+
+    v.extend(_leaks('뉴스 섹션의 표식 밖 산문', doc.section_stray_text))
+    if doc.section_stray > STRAY_MAX:
+        v.append(f'뉴스 섹션에 표식 밖 산문이 {doc.section_stray}자 있다 '
+                 f'(허용 {STRAY_MAX}자) — 기사는 `data-news` 블록 안에 둔다')
+
+    # 다이제스트 섹션은 **요약까지 만들어진** 갈래 기사가 있는 날에만 요구한다(1차 #5).
+    # 실을 수 없는 요약(가나·한자·두 문단·자기 정정)은 후보로 세지 않는다(2026-10-18)
+    usable = [it for it in items
+              if it.get('category') in categories and it.get('summary_ko')
+              and summary_problem(it['summary_ko']) is None]
+    if floor and usable:
+        cats, need = floor
+        shown = {}
+        for it in doc.section_items:
+            ref = it['guid'] and not it['hidden'] and known.get(_key(None, it['guid']))
+            if ref:
+                shown[ref.get('category')] = shown.get(ref.get('category'), 0) + 1
+        for cat in cats:
+            have = sum(1 for it in usable if it.get('category') == cat)
+            want = min(need, have)
+            if shown.get(cat, 0) < want:
+                v.append(f'「{cat}」 갈래가 {shown.get(cat, 0)}건이다 — 실을 수 있는 기사가 {have}건이니 '
+                         f'{want}건 이상 싣는다')
+    if usable:
+        if title not in (html or ''):
+            v.append(f'뉴스 섹션(「{title}」)을 찾을 수 없다 — 수집분 {len(usable)}건')
+        elif not [i for i in doc.section_items if i['guid'] and not i['hidden']]:
+            v.append(f'뉴스 섹션에 항목이 하나도 없다 — `data-news` 를 단 블록이 '
+                     f'필요하다 (수집분 {len(usable)}건)')
+    return v
+
+
+def _leaks(where, text):
+    """독자가 보는 글자에 남은 가나·한자 조각과 모델의 자기 정정 — 요약은 깨끗해도 작성자가 붙인
+    연결 문장이나 옛 수집분으로 들어온다(2026-10-18 /news/ 8편). 제목·캡션은 보지 않는다 — 일본 매체명과
+    KR 헤드라인의 「美·中」 은 그 자리에 정상으로 있다."""
+    v = []
+    runs = cjk_runs(text)
+    if runs:
+        v.append(f'{where}에 가나·한자 {"·".join(f"「{r}」" for r in runs[:3])} — 한국어로 옮긴다')
+    fix = self_correction(text)
+    if fix:
+        v.append(f'{where}에 모델의 자기 정정 문구 「{fix}」 — 지운다')
+    return v
+
+
+def coverage(block_text, summary):
+    """블록 글자 가운데 요약과 일치하는 구간에 든 몫(0~1)."""
+    a, b = re.sub(r'\s+', '', block_text or ''), re.sub(r'\s+', '', summary or '')
+    if not a or not b:
+        return 0.0
+    blocks = SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks()
+    return sum(m.size for m in blocks) / len(a)
+
+
+def similarity(block_text, summary):
+    """공백을 걷어낸 두 한국어 문단의 글자 단위 유사도(0~1)."""
+    a, b = re.sub(r'\s+', '', block_text or ''), re.sub(r'\s+', '', summary or '')
+    if not a or not b:
+        return 0.0
+    return SequenceMatcher(None, a, b, autojunk=False).ratio()
+
+
+def _key(source, guid):
+    return f'{source or ""}\x00{guid}'
+
+
+def _check_one(guid, block, known):
+    """항목 하나 — 실재·본문·분량·링크."""
+    row = known.get(_key(None, guid))
+    if row is None:
+        return [f'`data-news="{guid}"` 는 그날 수집분에 없다 — '
+                f'수집되지 않은 기사는 인용할 수 없다']
+    if not row.get('summary_ko'):
+        note = row.get('summary_note') or row.get('body_note') or '사유 미기재'
+        return [f'`data-news="{guid}"` 는 수집 요약(summary_ko)이 없다({note}) — '
+                f'제목만 보고 요약을 쓸 수 없다']
+    problem = summary_problem(row['summary_ko'])
+    if problem:
+        return [f'`data-news="{guid}"` 의 수집 요약을 실을 수 없다({problem}) — '
+                f'다시 수집·요약한 뒤 싣는다']
+
+    v = []
+    n = block['chars']
+    if n < MIN_CHARS:
+        v.append(f'`data-news="{guid}"` 요약이 {n}자로 짧다 (하한 {MIN_CHARS}자) '
+                 f'— RSS 한 줄 요약을 옮긴 것이 아닌지 볼 것')
+    elif n > MAX_CHARS:
+        v.append(f'`data-news="{guid}"` 요약이 {n}자로 길다 (상한 {MAX_CHARS}자)')
+
+    sim = similarity(block.get('text', ''), row['summary_ko'])
+    if sim < MIN_SIMILARITY:
+        v.append(f'`data-news="{guid}"` 블록이 수집 요약과 너무 다르다 (유사도 {sim:.2f}, '
+                 f'하한 {MIN_SIMILARITY}) — summary_ko 를 바탕으로 쓴다')
+    cov = coverage(block.get('text', ''), row['summary_ko'])
+    if cov < MIN_COVERAGE:
+        v.append(f'`data-news="{guid}"` 블록의 {1 - cov:.0%} 가 수집 요약에 없는 내용이다 '
+                 f'(허용 {1 - MIN_COVERAGE:.0%}) — 시세 연결 한 문장 외에는 요약에 있는 사실만 쓴다')
+
+    own = row.get('url')
+    for href in block['links']:
+        if href.startswith('#') or href == own:
+            continue
+        v.append(f'`data-news="{guid}"` 블록의 링크 {href} 는 이 기사의 원문이 '
+                 f'아니다 — 근거로 삼은 문서만 건다')
+    return v
