@@ -1,0 +1,10 @@
+{
+ "findings": [
+  {
+   "id": "F1",
+   "quote": "정규장은 하루 중 되돌림 없이 끝났다",
+   "material": true
+  }
+ ],
+ "first_seen": {}
+}
