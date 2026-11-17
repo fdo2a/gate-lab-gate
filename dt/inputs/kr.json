@@ -1,5 +1,5 @@
 {
- "_doc": "한국 일간. 규칙은 us.json 과 같다.",
+ "_doc": "한국 일간. 규칙은 us.json 과 같다. daily=true 는 거래일마다 내용이 바뀌는 파일 — 앞 거래일 스냅샷과 바이트가 같으면 낡은 것으로 본다. stale_ok_if_disclosed 는 기준일이 낡았어도 글이 그 절에서 그 날짜를 밝혔으면 기록만 한다.",
  "post": "kr/posts/{date}.html",
  "files": [
   {
@@ -25,12 +25,14 @@
   {
    "path": "datadir/kr_flows.json",
    "need": "always",
-   "fresh": "fetched"
+   "fresh": "fetched",
+   "daily": true
   },
   {
    "path": "datadir/kr_top_value.json",
    "need": "always",
-   "fresh": "fetched"
+   "fresh": "fetched",
+   "daily": true
   },
   {
    "path": "datadir/kr_econ.json",
@@ -40,7 +42,8 @@
   {
    "path": "datadir/kr_intraday.json",
    "need": "always",
-   "fresh": "fetched"
+   "fresh": "fetched",
+   "daily": true
   },
   {
    "path": "datadir/kr_stance_eval.json",
@@ -51,29 +54,33 @@
    "path": "datadir/kr_movers.json",
    "asof": true,
    "need": {
-    "marker": "data-mover\\b"
+    "marker": "data-mover\\b",
+    "related": "묶음|동반\\s*(?:급락|급등|하락|상승)|일제히"
    }
   },
   {
    "path": "datadir/kr_technical.json",
-   "fresh": "fetched",
    "need": {
     "heading": "기술적\\s*분석"
-   }
+   },
+   "asof": "코스피.as_of",
+   "stale_ok_if_disclosed": true
   },
   {
    "path": "datadir/kr_sector.html",
    "fresh": "fetched",
    "need": {
     "heading": "업종\\s*·\\s*섹터"
-   }
+   },
+   "daily": true
   },
   {
    "path": "datadir/kr_industry.json",
    "fresh": "fetched",
    "need": {
     "heading": "업종\\s*·\\s*섹터"
-   }
+   },
+   "daily": true
   },
   {
    "path": "datadir/kr_stock_moves.json",
@@ -120,5 +127,7 @@
    "unless_marker": "data-mover\\b"
   }
  },
- "extra_argv": {}
+ "extra_argv": {},
+ "absent_conditional": "review",
+ "_absent_conditional_doc": "조건부 자료가 빠졌고 글의 표식·제목·열쇠말에도 안 걸린 날: review = 사람이 「이 글에 그 자료가 필요한가」를 정한다(2026-11-17 사용자 결정). 필요 없음 → 발행, 필요함 → 보류(근거 확보 또는 주장 제외 뒤 다시 제출). 자료 없이 그대로 발행하는 답은 없다."
 }

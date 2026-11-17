@@ -1,28 +1,110 @@
 {
- "_doc": "미국 일간: 스냅샷 파일마다 언제 꼭 있어야 하는지. need=always 는 늘 필수, need={...} 는 글이 그 내용을 실었을 때만 필수(글 바이트로 판단), need=none 은 없어도 되고 기록만. asof 는 내용 속 기준일 필드, fresh=fetched 는 내용에 날짜가 없어 수집 기록의 시각으로 본다.",
+ "_doc": "미국 일간: 스냅샷 파일마다 언제 꼭 있어야 하는지. need=always 는 늘 필수, need={...} 는 글이 그 내용을 실었을 때만 필수(글 바이트로 판단), need=none 은 없어도 되고 기록만. asof 는 내용 속 기준일 필드, fresh=fetched 는 내용에 날짜가 없어 수집 기록의 시각으로 본다. need.related = 그 자료와 닿는 낱말(자료가 빠진 날 글에 이 낱말이 하나도 없으면 자동 통과, 있으면 사람 확인). need.claim = 자료가 있는 날, 한 문단에 이 낱말과 그 자료의 값 둘 이상이 함께 나오면 표식 없는 주장으로 본다.",
  "post": "posts/{date}.html",
  "files": [
-  {"path": "datadir/market_data.json", "need": "always", "asof": true},
-  {"path": "datadir/movers.json", "need": "always", "asof": true},
-  {"path": "datadir/calendar.json", "need": "always", "asof": true},
-  {"path": "datadir/macro_eval.json", "need": "always", "asof": true},
-  {"path": "datadir/macro_metrics.json", "need": "always", "asof": true},
-  {"path": "datadir/fund_board.json", "need": "always", "asof": true},
-  {"path": "datadir/telegram.json", "need": "always", "asof": true},
-  {"path": "datadir/fed/events.json", "need": "always", "asof": true},
-  {"path": "datadir/econ_indicators.json", "need": "always", "fresh": "fetched"},
-  {"path": "datadir/auctions.json", "asof": true,
-   "need": {"marker": "data-(?:auction(?:-day|-table|-row)?|demand)\\b", "heading": "국채\\s*입찰", "text": "응찰\\s*배율|응찰률|낙찰\\s*금리|딜러\\s*비중|bid-to-cover"}},
-  {"path": "datadir/liquidity/liquidity.json", "asof": true,
-   "need": {"marker": "data-liquidity\\b", "heading": "유동성\\s*·\\s*수급", "text": "H\\.4\\.1|분기\\s*차입\\s*계획|QRA"}},
-  {"path": "datadir/intraday.json", "fresh": "fetched", "need": {"text": "장중|개장가|장\\s*초반|오후\\s*들어"}},
-  {"path": "datadir/releases/index.json", "need": "none"},
-  {"path": "datadir/fund_board.html", "need": "none"},
-  {"path": "datadir/sector_performance.html", "need": "none"},
-  {"path": "datadir/yield_curve.png", "need": "none"}
+  {
+   "path": "datadir/market_data.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/movers.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/calendar.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/macro_eval.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/macro_metrics.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/fund_board.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/telegram.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/fed/events.json",
+   "need": "always",
+   "asof": true
+  },
+  {
+   "path": "datadir/econ_indicators.json",
+   "need": "always",
+   "fresh": "fetched"
+  },
+  {
+   "path": "datadir/auctions.json",
+   "asof": true,
+   "need": {
+    "marker": "data-(?:auction(?:-day|-table|-row)?|demand)\\b",
+    "heading": "국채\\s*입찰",
+    "text": "응찰\\s*배율|응찰률|낙찰\\s*금리|딜러\\s*비중|bid-to-cover",
+    "related": "입찰|응찰|낙찰|국채\\s*발행|물량\\s*소화|리오프닝|재발행",
+    "claim": "입찰|응찰|낙찰|재무부|발행|물량|주문|수요|배율"
+   }
+  },
+  {
+   "path": "datadir/liquidity/liquidity.json",
+   "asof": true,
+   "need": {
+    "marker": "data-liquidity\\b",
+    "heading": "유동성\\s*·\\s*수급",
+    "text": "H\\.4\\.1|분기\\s*차입\\s*계획|QRA",
+    "related": "유동성|지급\\s*준비|역레포|RRP|TGA|일반계정|대차대조표|양적\\s*긴축|QT|H\\.4\\.1|QRA|차입\\s*계획"
+   }
+  },
+  {
+   "path": "datadir/intraday.json",
+   "fresh": "fetched",
+   "need": {
+    "text": "장중|개장가|장\\s*초반|오후\\s*들어"
+   },
+   "daily": true
+  },
+  {
+   "path": "datadir/releases/index.json",
+   "need": "none"
+  },
+  {
+   "path": "datadir/fund_board.html",
+   "need": "none"
+  },
+  {
+   "path": "datadir/sector_performance.html",
+   "need": "none"
+  },
+  {
+   "path": "datadir/yield_curve.png",
+   "need": "none"
+  }
  ],
- "routine_state": ["datadir/macro.json", "datadir/macro_next.json", "src/research/us/"],
- "self_consistency_only": ["check_macro(체제 판단 부분)", "check_research"],
+ "routine_state": [
+  "datadir/macro.json",
+  "datadir/macro_next.json",
+  "src/research/us/"
+ ],
+ "self_consistency_only": [
+  "check_macro(체제 판단 부분)",
+  "check_research",
+  "check_liquidity(이전 글에서 만드는 원장 — 이전 글을 루틴이 낸 것에서 받는다)"
+ ],
  "skip_ok": {},
- "extra_argv": {}
+ "extra_argv": {},
+ "absent_conditional": "review",
+ "_absent_conditional_doc": "조건부 자료가 빠졌고 글의 표식·제목·열쇠말에도 안 걸린 날: review = 사람이 「이 글에 그 자료가 필요한가」를 정한다(2026-11-17 사용자 결정). 필요 없음 → 발행, 필요함 → 보류(근거 확보 또는 주장 제외 뒤 다시 제출). 자료 없이 그대로 발행하는 답은 없다."
 }

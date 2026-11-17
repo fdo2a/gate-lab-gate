@@ -17,6 +17,16 @@ DATE, PREV = '2026-11-16', '2026-11-13'
 SUB = {'us': {'commit': '3378e19652bbd5fdfef8281d4b33ad7fe18a4cb5', 'post': 'posts/2026-11-16.html', 'cycle': 'us-2026-11-16-daily-cycle',
               'state_prev': ('e9ef1a8394b4ae95dd9a7e663f22ac38b68096ff', 'data/macro.json')},
        'kr': {'commit': '1b2e0050024159ab55b828d57d19e8c9539a2eab', 'post': 'kr/posts/2026-11-16.html', 'cycle': 'kr-2026-11-16-cycle'}}
+# 실제 발행 글(운영 저장소 발행 커밋) — 정상 글을 잘못 막는지 재는 데 쓴다. (날짜, 발행 커밋, 앞 상태를 읽을 커밋)
+REAL = {'us': [('2026-11-09', '8bc6e2543befd876881f2294e00abd58ee89c82d', 'c93ea278aac51ce86be0d6d2a7599eeb65f93670'),
+               ('2026-11-10', '4f51fd9bce246793d8e93688e73ebc6abb8dbce5', '8bc6e2543befd876881f2294e00abd58ee89c82d'),
+               ('2026-11-11', '68fdf456e1d9574d61f98d4f594f38dfa18bef98', '4f51fd9bce246793d8e93688e73ebc6abb8dbce5'),
+               ('2026-11-12', '3ab3e3f617edc074d63ddc335722506fffd6a28b', '68fdf456e1d9574d61f98d4f594f38dfa18bef98'),
+               ('2026-11-13', '7e18f8bc2bdc20d736608414e29b2e07efc42833', '3ab3e3f617edc074d63ddc335722506fffd6a28b'),
+               ('2026-11-16', '3378e19652bbd5fdfef8281d4b33ad7fe18a4cb5', 'e9ef1a8394b4ae95dd9a7e663f22ac38b68096ff')],
+        'kr': [('2026-11-09', '73f2d8225a52ab146a04e4578cc53ffaabe95f02', None), ('2026-11-10', '18feaabbbe96bb2f5b51635bc1990bacd75a9b58', None),
+               ('2026-11-11', 'bba3fc0ebc0c895e0197694cc74d7799a1e0e96f', None), ('2026-11-12', '252d765b5ec732247bbb9b6834e95ed494f6e300', None),
+               ('2026-11-13', '61bd4b8c4f1834af2272e1968baecb33ca8f5167', None), ('2026-11-16', '1b2e0050024159ab55b828d57d19e8c9539a2eab', None)]}
 EVIL = "import os\nopen(os.environ.get('MARK', '/tmp/pwned'), 'a').write(__file__ + '\\n')\n"
 PLANT = ['sitecustomize.py', 'usercustomize.py', 'json.py', 'html.py', 're.py', 'conftest.py', 'common.py', 'us.py', 'kr.py',
          'verification.py', 'fund.py', 'research/json.py', 'research/{m}/sitecustomize.py', 'research/{m}/__init__.py',
@@ -31,11 +41,11 @@ def sha(b):
     return hashlib.sha256(b).hexdigest()
 
 
-def submission(m, root):
+def submission(m, root, date=DATE, commit=None, prev=None):
     """루틴이 낸 것에서 받는 것만 꺼낸다 — 글, 루틴 상태, 연구 원장(과 미국의 이전 글). 악성 파일을 함께 심는다."""
-    c = SUB[m]['commit']
-    post = git('cat-file', 'blob', '%s:%s' % (c, SUB[m]['post']))
-    src = os.path.join(root, 'sub-src-' + m)
+    c = commit or SUB[m]['commit']
+    post = git('cat-file', 'blob', '%s:%s' % (c, SUB[m]['post'].replace(DATE, date)))
+    src = os.path.join(root, 'sub-src-%s-%s' % (m, date))
     if not os.path.isdir(src):
         want = ['research/' + m] + (['posts'] if m == 'us' else [])
         for ent in git('ls-tree', '-r', '-z', c, '--', *want).decode('utf-8', 'surrogateescape').split('\0'):
@@ -53,7 +63,7 @@ def submission(m, root):
             os.makedirs(os.path.dirname(p), exist_ok=True)
             open(p, 'w').write(EVIL)
     if m == 'us':
-        pc, pp = SUB[m]['state_prev']
+        pc, pp = (prev, 'data/macro.json') if prev else SUB[m]['state_prev']
         state = {'datadir/macro_next.json': git('cat-file', 'blob', '%s:data/macro.json' % c),
                  'datadir/macro.json': git('cat-file', 'blob', '%s:%s' % (pc, pp))}
     else:
@@ -68,6 +78,8 @@ def view(snaps, tmp, m, edit=None):
     """snapshots/<m>/<DATE> 를 복사하고 edit(dir) 로 바꾼다. edit 는 수집기가 했을 법한 일만 한다."""
     root = os.path.join(tmp, 'snap')
     shutil.copytree(os.path.join(snaps, m, DATE), os.path.join(root, m, DATE))
+    if os.path.isdir(os.path.join(snaps, m, PREV)):
+        shutil.copytree(os.path.join(snaps, m, PREV), os.path.join(root, m, PREV))
     if edit:
         edit(os.path.join(root, m, DATE))
     return root
@@ -136,6 +148,32 @@ def add_version(kind, invalidates, mutate):
     return f
 
 
+def stale_wrapped(snaps, m, path):
+    """전 거래일 파일의 바이트를 오늘 자리에 두되 수집 기록(받은 시각)은 오늘 것 그대로 — 시각은 새것, 내용은 낡은 것."""
+    def f(base):
+        shutil.copyfile(os.path.join(snaps, m, PREV, 'v1', 'files', path), os.path.join(base, 'v1', 'files', path))
+        reseal(base)
+    return f
+
+
+def strip_dates_in_section(post, heading, old, new):
+    text = post.decode('utf-8')
+    h = re.search(r'<h[23][^>]*>[^<]*%s' % heading, text)
+    end = text.index('</section>', h.end())
+    return (text[:h.end()] + text[h.end():end].replace(old, new) + text[end:]).encode('utf-8')
+
+
+def strip_related(post, m, path):
+    """정책의 「닿는 낱말」을 글의 보이는 글자에서 모두 지운다(태그 안은 건드리지 않는다)."""
+    pol = json.load(open(os.path.join(HERE, 'inputs', m + '.json'), encoding='utf-8'))
+    rel = next(f['need']['related'] for f in pol['files'] if f['path'] == path)
+    def one(sec):
+        if '트렌드 유닛 점검' in sec.group(0):      # 그 절은 펀드 자료와 글자까지 맞춰 보므로 건드리지 않는다
+            return sec.group(0)
+        return re.sub(r'>[^<]+<', lambda x: re.sub(rel, '○○', x.group(0), flags=re.I), sec.group(0))
+    return re.sub(r'<section\b.*?</section\s*>', one, post.decode('utf-8'), flags=re.S).encode('utf-8')
+
+
 def corrupt(path):
     def f(base):
         p = os.path.join(base, 'v1', 'files', path)
@@ -201,6 +239,7 @@ def insert_before_section_end(post, heading, html):
 
 AUCTION_SECTION = ('</section><section id="read-x"><h2>국채 입찰</h2><div data-auction-day="2026-11-16">'
                    '<p data-auction="nominal-30y">30년물 입찰은 응찰배율 2.36배, 딜러 비중 11.4%였다.</p></div>')
+MOVER_PROSE = '<p>이날 2차전지 장비 묶음은 6.4% 내려 업종 가운데 낙폭이 가장 컸고, 묶음 안 8종목이 모두 내렸다.</p>'
 AUCTION_PROSE = '<p>재무부가 이날 판 30년물은 찾는 쪽이 적었다. 받아 간 물량에 견준 주문은 2.36배였고 금리는 5.441%에 정해졌다.</p>'
 
 
@@ -215,23 +254,43 @@ def build_cases(snaps):
     # 정상 대조군 — 문지기가 「전부 보류」가 아님을 보인다
     add('P1', 'us', '정상 글·정상 자료', 'publish')
     add('P2', 'kr', '정상 글·정상 자료', 'publish')
-    add('P3', 'us', '국채 입찰 자료 없음, 글에 입찰 절도 없음(선택 자료)', 'publish', gap='optional_input_absent:datadir/auctions.json', snap=drop('datadir/auctions.json'))
-    add('P4', 'us', '유동성 자료 없음, 글에 유동성·수급 절도 없음(선택 자료)', 'publish', gap='optional_input_absent:datadir/liquidity/liquidity.json', snap=drop('datadir/liquidity/liquidity.json'))
-    add('P5', 'kr', '특징주 묶음 자료 없음, 글에 묶음 표식도 없음(선택 자료)', 'publish', gap='optional_input_absent:datadir/kr_movers.json', snap=drop('datadir/kr_movers.json'))
+    add('P3', 'us', '[정상 글] 국채 입찰 자료 없음. 글에 입찰 절은 없지만 일정 안내에 「입찰」이라는 낱말이 있다 → 쓴 것인지 불명확', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json', snap=drop('datadir/auctions.json'))
+    add('P3r', 'us', '위 글에 사람이 「이 자료는 필요 없다」고 답함(답은 글 해시에 묶임)', 'publish', note='human_confirmed_not_needed:datadir/auctions.json', snap=drop('datadir/auctions.json'), review={'datadir/auctions.json': 'not_needed'})
+    add('P3s', 'us', '사람의 답이 다른 글(다른 해시)에 대한 것이면 쓰이지 않는다', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json', snap=drop('datadir/auctions.json'), review={'datadir/auctions.json': 'not_needed'}, review_other_hash=True)
+    add('P4', 'us', '[정상 글] 유동성 자료 없음. 글에 유동성·수급 절은 없지만 다른 절에 「유동성」이 나온다 → 불명확', 'needs_review', note='conditional_evidence_absent:datadir/liquidity/liquidity.json', snap=drop('datadir/liquidity/liquidity.json'))
+    add('P5', 'kr', '[정상 글] 특징주 묶음 자료 없음. 글이 「종목 묶음을 싣지 않는다」「은행주 동반 상승」이라고 씀 → 불명확', 'needs_review', note='conditional_evidence_absent:datadir/kr_movers.json', snap=drop('datadir/kr_movers.json'))
+    add('P6', 'us', '[정상 글] 입찰 자료 없음, 글에서 입찰과 닿는 낱말을 모두 지움 → 관련 분석이 없는 선택 자료로 자동 통과', 'publish', note='no_related_content:datadir/auctions.json', snap=drop('datadir/auctions.json'),
+        post=lambda p: strip_related(p, 'us', 'datadir/auctions.json'))
     # 1. 입력 누락
     add('M1', 'us', '시세 자료(market_data) 없음', 'hold', 'required_input_missing:datadir/market_data.json', snap=drop('datadir/market_data.json'))
     add('M2', 'us', '경제지표 자료 없음 — 지금 운영 검사는 「일부만 검사」로 통과시킨다', 'hold', 'required_input_missing:datadir/econ_indicators.json', snap=drop('datadir/econ_indicators.json'))
     add('M3', 'us', '글에 국채 입찰 절을 실었는데 입찰 자료 없음', 'hold', 'required_input_missing:datadir/auctions.json', snap=drop('datadir/auctions.json'),
         post=lambda p: insert_before_section_end(p, '채권', AUCTION_SECTION))
-    add('M4', 'us', '[자기 공격] 표식·절 제목·열쇠말 없이 문장으로만 입찰 결과를 쓰고 입찰 자료 없음', 'observe', snap=drop('datadir/auctions.json'),
+    # 네 반례(1회차에서 발행됐던 것)와 그 처리
+    add('M4', 'us', '[반례1] 표식·절 제목·열쇠말 없이 문장으로만 입찰 결과를 쓰고 입찰 자료 없음', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json',
+        snap=drop('datadir/auctions.json'), post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE))
+    add('M4n', 'us', '반례1에 사람이 「이 자료가 필요하다」고 답함 → 근거를 구하거나 그 문장을 빼고 다시 내야 한다', 'hold', 'claim_without_evidence:datadir/auctions.json',
+        snap=drop('datadir/auctions.json'), post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE), review={'datadir/auctions.json': 'needed'})
+    add('M4b', 'us', '[반례2] 반례1과 같고 문장 숫자 대조를 차단으로 켬', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json', snap=drop('datadir/auctions.json'),
+        post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE), prose_block=True)
+    add('M4c', 'us', '[반례3] 같은 문장, 입찰 자료는 있음 — 절·표식 없이 그 자료의 값을 문장에 씀', 'hold', 'unmarked_claim:datadir/auctions.json',
         post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE))
-    add('M4b', 'us', '[자기 공격] 위와 같고, 문장 숫자 대조를 차단으로 켬', 'observe', snap=drop('datadir/auctions.json'),
-        post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE), prose_block=True)
-    add('M4c', 'us', '[대조군] 같은 문장, 입찰 자료 있음, 문장 숫자 대조 차단', 'observe',
-        post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE), prose_block=True)
+    add('M4k', 'kr', '[반례4] 묶음 표식 없이 문장으로만 「묶음이 6.4% 내렸다」를 쓰고 묶음 자료 없음', 'needs_review', note='conditional_evidence_absent:datadir/kr_movers.json',
+        snap=drop('datadir/kr_movers.json'), post=lambda p: insert_before_section_end(p, '특징주', MOVER_PROSE))
+    # 여전히 열린 문제 — 자동 차단이 입증되지 않은 것(보류돼야 하는데 발행된다)
+    add('O1', 'us', '[열린 문제] 입찰 자료는 있음. 숫자 없이 「이날 30년물 입찰은 수요가 약했다」고만 씀(그날 입찰은 없었다)', 'hold', known_open=True,
+        post=lambda p: insert_before_section_end(p, '채권', '<p>이날 30년물 입찰은 수요가 약했다.</p>'))
+    add('O2', 'us', '[열린 문제] 입찰 자료 없음. 닿는 낱말을 모두 피해 「새로 나온 30년 만기 물량은 주문이 2.36배에 그쳤다」고 씀', 'hold', known_open=True,
+        snap=drop('datadir/auctions.json'), post=lambda p: insert_before_section_end(strip_related(p, 'us', 'datadir/auctions.json'), '채권', '<p>새로 나온 30년 만기 물량은 주문이 2.36배에 그쳤다.</p>'))
+    add('O3', 'us', '[열린 문제] 입찰 자료는 있음. 그 자료의 숫자 하나만 문장에 씀(「30년물은 5.441%에 정해졌다」)', 'hold', known_open=True,
+        post=lambda p: insert_before_section_end(p, '채권', '<p>새로 나온 30년물은 5.441%에 정해졌다.</p>'))
     add('M5', 'us', '장중 자료 없음, 글이 장중 흐름을 씀(어느 검사기도 이 자료를 안 본다)', 'hold', 'required_input_missing:datadir/intraday.json', snap=drop('datadir/intraday.json'))
     add('M6', 'kr', '시세 자료(kr_market_data) 없음', 'hold', 'required_input_missing:datadir/kr_market_data.json', snap=drop('datadir/kr_market_data.json'))
     add('M7', 'kr', '기술적 분석 자료 없음, 글에 기술적 분석 절 있음(어느 검사기도 이 자료를 안 본다)', 'hold', 'required_input_missing:datadir/kr_technical.json', snap=drop('datadir/kr_technical.json'))
+    add('M7a', 'kr', '[회피 시도] 위와 같고 절 제목의 한 글자를 문자 참조(&#…;)로 바꿈', 'hold', 'required_input_missing:datadir/kr_technical.json', snap=drop('datadir/kr_technical.json'),
+        post=lambda p: p.replace('기술적 분석'.encode(), '&#44592;술적 분석'.encode()))
+    add('M7b', 'kr', '[회피 시도] 위와 같고 절 제목에 폭 없는 문자를 끼움', 'hold', 'required_input_missing:datadir/kr_technical.json', snap=drop('datadir/kr_technical.json'),
+        post=lambda p: p.replace('기술적 분석'.encode(), '기​술적 분석'.encode()))
     add('M8', 'kr', '판단 채점 자료(kr_stance_eval) 없음 — 지금 운영 검사는 그대로 통과시킨다', 'hold', 'required_input_missing:datadir/kr_stance_eval.json', snap=drop('datadir/kr_stance_eval.json'))
     add('M9', 'us', '그날 스냅샷이 아예 없음', 'hold', 'snapshot_missing', snap=lambda base: shutil.rmtree(base))
     # 검사 도구가 못 돎 — 글이 틀린 것과 다른 상태
@@ -239,11 +298,12 @@ def build_cases(snaps):
     add('E2', 'kr', '검사 프로그램 하나가 없음', 'hold', 'tool_error:check_session', code='missing:check_session.py')
     add('E3', 'us', '[대조] 글 숫자가 틀림 — 도구 고장과 다른 이유 부호', 'hold', 'gate_failed:check_numbers', post='bump:주식')
     # 2. 입력 변조
-    add('T1', 'us', '글의 숫자와 루틴 쪽 자료를 똑같이 고침 → 문지기는 보호된 자료로 검사', 'hold', 'gate_failed:check_numbers', tamper=('datadir/market_data.json', '원자재'))
+    add('T1', 'us', '글의 숫자를 고치고, 똑같이 고친 자료를 낼 수 있는 길마다 함께 냄(루틴 상태 자리·검증 기록·제출 폴더) → 문지기는 보호된 자료로 검사', 'hold', 'gate_failed:check_numbers', tamper=('datadir/market_data.json', '원자재'))
     add('T1L', 'us', '[옛 방식 대조] 같은 조작, 문지기가 루틴 쪽 자료로 검사하면', 'publish', tamper=('datadir/market_data.json', '원자재'), legacy=True)
-    add('T2', 'kr', '글의 숫자와 루틴 쪽 자료를 똑같이 고침 → 문지기는 보호된 자료로 검사', 'hold', 'gate_failed:check_numbers', tamper=('datadir/kr_market_data.json', '지수'))
+    add('T2', 'kr', '글의 숫자를 고치고, 똑같이 고친 자료를 낼 수 있는 길마다 함께 냄 → 문지기는 보호된 자료로 검사', 'hold', 'gate_failed:check_numbers', tamper=('datadir/kr_market_data.json', '지수'))
     add('T2L', 'kr', '[옛 방식 대조] 같은 조작, 문지기가 루틴 쪽 자료로 검사하면', 'publish', tamper=('datadir/kr_market_data.json', '지수'), legacy=True)
-    add('T3', 'us', '루틴이 정책에 없는 파일(시세 자료·검증 기록)을 「루틴 상태」로 끼워 냄 → 받지 않음', 'hold', 'gate_failed:check_numbers', tamper=('datadir/market_data.json', '원자재'), smuggle=True)
+    add('T3', 'us', '글은 그대로 두고, 고친 자료만 같은 길들로 냄 → 판정에 아무 영향이 없어야 한다', 'publish', tamper=('datadir/market_data.json', '원자재'), keep_post=True)
+    add('T4', 'kr', '글은 그대로 두고, 고친 자료만 같은 길들로 냄 → 판정에 아무 영향이 없어야 한다', 'publish', tamper=('datadir/kr_market_data.json', '지수'), keep_post=True)
     add('X1', 'us', '스냅샷 파일이 목록의 해시와 다름(보관 중 변형)', 'hold', 'snapshot_file_hash_mismatch:datadir/market_data.json', snap=corrupt('datadir/market_data.json'))
     add('X2', 'us', '직접 받은 원천과 대역 자료가 어긋났다고 수집 기록에 적힘', 'hold', 'source_crosscheck_mismatch:datadir/auctions.json', snap=xcheck_false)
     # 3. 자료 시점
@@ -253,12 +313,18 @@ def build_cases(snaps):
     add('S4', 'kr', '스냅샷 전체가 전 거래일(11/13) 자료', 'hold', 'stale_input:datadir/kr_market_data.json', snap=swap_from_prev(snaps, 'kr', None))
     add('S5', 'kr', '장 구분 자료 하나만 전 거래일 것', 'hold', 'stale_input:datadir/kr_session.json', snap=swap_from_prev(snaps, 'kr', ['datadir/kr_session.json']))
     add('S6', 'kr', '내용에 날짜가 없는 자료(수급)가 전 거래일에 받은 것', 'hold', 'stale_fetch:datadir/kr_flows.json', snap=swap_from_prev(snaps, 'kr', ['datadir/kr_flows.json']))
+    add('S7', 'us', '날짜 없는 자료(장중)가 받은 시각은 오늘인데 내용은 전 거래일과 한 바이트도 안 다름', 'hold', 'stale_content:datadir/intraday.json', snap=stale_wrapped(snaps, 'us', 'datadir/intraday.json'))
+    add('S8', 'kr', '날짜 없는 자료(수급)가 받은 시각은 오늘인데 내용은 전 거래일과 같음', 'hold', 'stale_content:datadir/kr_flows.json', snap=stale_wrapped(snaps, 'kr', 'datadir/kr_flows.json'))
+    add('S9', 'kr', '[실제 사례] 11/16 기술적 분석 자료는 기준일이 11/13 — 글이 그 절에서 「11월 13일 기준」이라고 밝혔다', 'publish', gap='stale_but_disclosed:datadir/kr_technical.json(as_of=2026-11-13)')
+    add('S10', 'kr', '같은 자료, 글에서 그 기준일 표기를 지움(11/16 자료인 것처럼 씀)', 'hold', 'stale_input:datadir/kr_technical.json',
+        post=lambda p: strip_dates_in_section(p, '기술적', '11월 13일', '11월 16일'))
     # 4. 재검증 — 이미 실린 글
     add('R1', 'us', '실린 글을 같은 자료로 다시 판정', 'publish', rejudge=True)
     add('R2', 'us', '실린 뒤 자료에 개정판(v2, 원천이 나중에 고침)이 덧붙음 — 승인 근거 v1 은 유효', 'publish', note='newer_snapshot_available:v2(revision)', rejudge=True, v2=('revision', []))
     add('R3', 'us', '실린 뒤 승인 근거였던 v1 이 잘못으로 판명(v2 정정판이 v1 을 무효로)', 'withdraw', 'gate_failed:check_numbers', note='approved_snapshot_invalidated:v1', rejudge=True, v2=('correction', [1]))
     add('R4', 'us', '개정판 v2 가 있을 때 새로 내는 글은 최신 판으로 본다', 'hold', 'gate_failed:check_numbers', v2=('revision', []))
     add('R5', 'us', '실린 글 재판정 때 검사 도구가 죽음 → 내리지 않고 표시만', 'keep_flagged', 'tool_error:check_fund', rejudge=True, code='crash:check_fund.py')
+    add('R7', 'us', '실린 글 재판정 때 스냅샷 파일이 변형돼 있음 → 내리지 않고 표시만(뒤따르는 누락·실패로 내리지 않는다)', 'keep_flagged', 'snapshot_file_hash_mismatch:datadir/market_data.json', rejudge=True, snap=corrupt('datadir/market_data.json'))
     add('R6', 'kr', '실린 뒤 승인 근거였던 v1 이 무효가 됨', 'withdraw', 'gate_failed:check_numbers', note='approved_snapshot_invalidated:v1', rejudge=True, v2=('correction', [1]))
     return C
 
@@ -301,7 +367,7 @@ def run_case(arg):
         import traceback
         return {'id': arg[0], 'market': '?', 'what': '사례 실행 오류', 'detail': traceback.format_exc()[-400:], 'expect': '?', 'expect_reason': '',
                 'decision': 'case_error', 'reasons': [repr(exc)[:200]], 'gaps': [], 'notes': [], 'snapshot': None, 'post_sha256': None,
-                'checker_tree_sha256': None, 'policy_sha256': None, 'gates': {}, 'hostile_executed': 0, 'ok': False}
+                'checker_tree_sha256': None, 'policy_sha256': None, 'gates': {}, 'hostile_executed': 0, 'foreign_code': [], 'known_open': False, 'ok': False}
 
 
 def _run_case(arg):
@@ -322,9 +388,20 @@ def _run_case(arg):
             path, heading = c['tamper']
             good = open(os.path.join(snaps, m, DATE, 'v1', 'files', path), 'rb').read()
             post, bad, detail = paired_tamper(post0, good, heading)
-            if c.get('smuggle'):
+            if c.get('keep_post'):
+                post = post0
+            if not c.get('legacy'):
+                # 루틴이 고친 자료를 낼 수 있는 길마다 실제로 낸다: 루틴 상태 자리, 검증 기록, 제출 폴더의 자료 경로들
                 sub['routine_state'][path] = bad
                 sub['routine_state']['verification/%s/%s.json' % (m, DATE)] = b'{"summary":{"publish_ok":true}}'
+                src2 = os.path.join(tmp, 'src')
+                shutil.copytree(sub['src'], src2, symlinks=True)
+                name = os.path.basename(path)
+                for rel in ('data/' + name, 'kr/data/' + name, 'datadir/' + name, name, 'snapshots/%s/%s/v1/files/%s' % (m, DATE, path)):
+                    dst = os.path.join(src2, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    open(dst, 'wb').write(bad)
+                sub['src'] = src2
             if c.get('legacy'):                     # 옛 방식: 문지기가 루틴이 고친 자료를 그대로 믿는다
                 def snap_edit(base, path=path, bad=bad):
                     open(os.path.join(base, 'v1', 'files', path), 'wb').write(bad)
@@ -344,7 +421,9 @@ def _run_case(arg):
             pol_dir = os.path.join(tmp, 'pol')
             shutil.copytree(os.path.join(HERE, 'inputs'), pol_dir)
         v = J.judge(m, DATE, post, sub, root, os.path.join(tmp, 'w1'), SUB[m]['cycle'], prev=prev, published=published, code=code,
-                    snap_ref=snap_ref, extra_argv={'check_numbers': ['--prose', 'block']} if c.get('prose_block') else None)
+                    snap_ref=snap_ref, extra_argv={'check_numbers': ['--prose', 'block']} if c.get('prose_block') else None,
+                    absent_conditional=c.get('absent'),
+                    reviews={('0' * 64 if c.get('review_other_hash') else J.sha(post)): c['review']} if c.get('review') else None)
         ok = True
         if c['expect'] != 'observe':
             ok = v['decision'] == c['expect']
@@ -358,7 +437,47 @@ def _run_case(arg):
         return {'id': c['id'], 'market': m, 'what': c['what'], 'detail': detail, 'expect': c['expect'], 'expect_reason': c.get('reason') or c.get('gap') or c.get('note') or '',
                 'decision': v['decision'], 'reasons': v['reasons'], 'gaps': v['gaps'], 'notes': v['notes'], 'snapshot': v['snapshot'],
                 'post_sha256': v['post_sha256'], 'checker_tree_sha256': v['checker_tree_sha256'], 'policy_sha256': v['policy_sha256'],
-                'gates': {g['name']: g['status'] for g in v['gates']}, 'hostile_executed': v['hostile_executed'], 'ok': ok}
+                'gates': {g['name']: g['status'] for g in v['gates']}, 'hostile_executed': v['hostile_executed'], 'foreign_code': v.get('foreign_code', []),
+                'known_open': bool(c.get('known_open')), 'ok': ok}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def real_post(arg):
+    """실제 발행 글을 그 날짜의 스냅샷으로 판정 — 정상 글이 막히는가."""
+    m, date, commit, prev, snaps, out, snap_ref = arg
+    tmp = tempfile.mkdtemp(prefix='real-')
+    try:
+        post, sub = submission(m, out, date, commit, prev)
+        cyc = re.search(rb'data-research-cycle="([^"]+)"', post)          # 주기 이름은 글 바이트에서 읽는다
+        v = J.judge(m, date, post, sub, snaps, os.path.join(tmp, 'w'), cyc.group(1).decode() if cyc else None, snap_ref=snap_ref)
+        return {'market': m, 'date': date, 'commit': commit[:8], 'decision': v['decision'], 'reasons': v['reasons'], 'gaps': v['gaps'], 'notes': v['notes'],
+                'gates': {g['name']: g['status'] for g in v['gates'] if g['status'] != 'pass'}, 'first': {g['name']: g['first'] for g in v['gates'] if g['status'] in ('fail', 'indeterminate')},
+                'post_sha256': v['post_sha256'], 'snapshot': v['snapshot'], 'source_unverified_inputs': v.get('source_unverified_inputs'),
+                'required_inputs': len(v.get('required_inputs') or []), 'hostile_executed': v['hostile_executed']}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def real_absent(arg):
+    """실제 발행 글에서 조건부 자료 하나가 빠진 날을 흉내 낸다 — 자동 통과 / 사람 확인 / 보류 가운데 어디로 가는가."""
+    m, date, commit, prev, path, snaps, out = arg
+    tmp = tempfile.mkdtemp(prefix='ra-')
+    try:
+        post, sub = submission(m, out, date, commit, prev)
+        root = os.path.join(tmp, 'snap')
+        for d in sorted(os.listdir(os.path.join(snaps, m))):
+            if d <= date:
+                shutil.copytree(os.path.join(snaps, m, d), os.path.join(root, m, d))
+        base = os.path.join(root, m, date)
+        if not os.path.isfile(os.path.join(base, 'v1', 'files', path)):
+            return {'market': m, 'date': date, 'removed': path, 'decision': 'n/a', 'why': '그날 스냅샷에 원래 없음', 'hostile_executed': 0}
+        os.remove(os.path.join(base, 'v1', 'files', path))
+        reseal(base)
+        cyc = re.search(rb'data-research-cycle="([^"]+)"', post)
+        v = J.judge(m, date, post, sub, root, os.path.join(tmp, 'w'), cyc.group(1).decode() if cyc else None)
+        why = [r for r in v['reasons'] if path in r] + [n for n in v['notes'] if path in n]
+        return {'market': m, 'date': date, 'removed': path, 'decision': v['decision'], 'why': '; '.join(why)[:200], 'hostile_executed': v['hostile_executed']}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -409,16 +528,29 @@ def main():
                     paths = keep
                 jobs += [(m, p, snaps, out) for p in paths]
             sv = pool.map(survey, jobs)
+        real = []
+        if not a.only or a.only == 'REAL':
+            real = pool.map(real_post, [(m, d, c, pv, snaps, out, a.snap_ref) for m in ('us', 'kr') for d, c, pv in REAL[m]
+                                        if os.path.isdir(os.path.join(snaps, m, d))])
     meta = {'gate_sha': os.environ.get('GITHUB_SHA'), 'run': os.environ.get('GITHUB_RUN_ID'),
             'run_url': '%s/%s/actions/runs/%s' % (os.environ.get('GITHUB_SERVER_URL'), os.environ.get('GITHUB_REPOSITORY'), os.environ.get('GITHUB_RUN_ID')) if os.environ.get('GITHUB_RUN_ID') else None,
             'data_repo_sha': a.snap_ref, 'python': sys.version.split()[0], 'submission_commits': {m: SUB[m]['commit'] for m in SUB},
             'planted_per_submission': len(PLANT)}
-    json.dump({'meta': meta, 'cases': rows, 'survey': sv}, open(os.path.join(out, 'matrix.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    ra = []
+    if real:
+        with Pool(a.jobs) as pool:
+            jobs = []
+            for m in ('us', 'kr'):
+                pol = json.load(open(os.path.join(HERE, 'inputs', m + '.json'), encoding='utf-8'))
+                cond = [f['path'] for f in pol['files'] if isinstance(f.get('need'), dict)]
+                jobs += [(m, d, c, pv, path, snaps, out) for d, c, pv in REAL[m] if os.path.isdir(os.path.join(snaps, m, d)) for path in cond]
+            ra = pool.map(real_absent, jobs)
+    json.dump({'meta': meta, 'cases': rows, 'survey': sv, 'real_posts': real, 'real_absent': ra}, open(os.path.join(out, 'matrix.json'), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     lines = ['| 사례 | 시장 | 무엇을 | 기대 | 판정 | 이유 | 맞음 |', '|---|---|---|---|---|---|---|']
     for r in rows:
-        why = '; '.join(r['reasons'][:3] + r['gaps'][:2] + r['notes'][:2])
+        why = '; '.join(r['reasons'][:3] + r['gaps'][:3] + r['notes'][:2])
         lines.append('| %s | %s | %s %s | %s %s | %s | %s | %s |' % (r['id'], r['market'], r['what'], ('(' + r['detail'] + ')') if r['detail'] else '',
-                     r['expect'], r['expect_reason'], r['decision'], why, 'O' if r['ok'] else 'X'))
+                     r['expect'], r['expect_reason'], r['decision'], why, 'O' if r['ok'] else ('열린 문제' if r['known_open'] else 'X')))
     if sv:
         lines += ['', '| 시장 | 뺀 파일 | 판정 | 이유 |', '|---|---|---|---|']
         for r in sv:
@@ -427,9 +559,29 @@ def main():
             x = [r for r in sv if r['market'] == m]
             lines.append('')
             lines.append('%s: 하나씩 뺀 %d가지 중 발행 %d · 보류 %d' % (m, len(x), sum(r['decision'] == 'publish' for r in x), sum(r['decision'] != 'publish' for r in x)))
-    hostile = sum(r['hostile_executed'] for r in rows) + sum(r['hostile_executed'] for r in sv)
-    bad = [r['id'] for r in rows if not r['ok']]
-    lines += ['', 'cases %d · mismatched %d %s · hostile modules executed %d (planted %d per submission)' % (len(rows), len(bad), bad, hostile, len(PLANT))]
+    if real:
+        lines += ['', '실제 발행 글(운영 저장소 발행 커밋 그대로) — 정상 글이 막히는가', '', '| 시장 | 날짜 | 판정 | 이유·기록 |', '|---|---|---|---|']
+        for r in real:
+            lines.append('| %s | %s | %s | %s |' % (r['market'], r['date'], r['decision'], '; '.join(r['reasons'] + r['notes'] + [g for g in r['gaps'] if not g.startswith('check_warned')])[:300]))
+        lines.append('')
+        lines.append('real posts %d · publish %d · needs_review %d · hold %d' % (len(real), sum(r['decision'] == 'publish' for r in real),
+                     sum(r['decision'] == 'needs_review' for r in real), sum(r['decision'] == 'hold' for r in real)))
+    if ra:
+        import collections
+        lines += ['', '실제 발행 글에서 조건부 자료 하나가 빠진 날이라면(자료별·판정별 글 수)', '', '| 시장 | 빠진 자료 | 자동 통과 | 사람 확인 | 보류(글이 그 내용을 실음) | 원래 없음 |', '|---|---|---|---|---|---|']
+        agg = collections.defaultdict(collections.Counter)
+        for r in ra:
+            agg[(r['market'], r['removed'])][r['decision']] += 1
+        for (m, path), c in sorted(agg.items()):
+            lines.append('| %s | %s | %d | %d | %d | %d |' % (m, path, c['publish'], c['needs_review'], c['hold'], c['n/a']))
+    hostile = sum(r['hostile_executed'] for r in rows) + sum(r['hostile_executed'] for r in sv) + sum(r['hostile_executed'] for r in real) + sum(r['hostile_executed'] for r in ra)
+    bad = [r['id'] for r in rows if not r['ok'] and not r['known_open']]
+    opened = [r['id'] for r in rows if not r['ok'] and r['known_open']]
+    closed = [r['id'] for r in rows if r['ok'] and r['known_open']]
+    lines += ['', 'cases %d · as expected %d · known open (should hold, still publishes) %d %s · unexpected %d %s · code executed from outside the pinned copy %d (planted %d per submission)'
+              % (len(rows), sum(r['ok'] for r in rows), len(opened), opened, len(bad), bad, hostile, len(PLANT))]
+    if closed:
+        lines.append('known-open cases that now hold: %s' % closed)
     open(os.path.join(out, 'matrix.md'), 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
     print('\n'.join(lines))
     return 1 if bad or hostile else 0

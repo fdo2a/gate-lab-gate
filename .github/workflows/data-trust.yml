@@ -7,7 +7,7 @@ jobs:
   judge:
     # 비밀값 없음. 루틴이 낸 것(운영 저장소 발행 커밋이 대역)은 자료로만 받고, 검사 자료는 보호된 자료 저장소에서만 받는다.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -16,7 +16,11 @@ jobs:
         run: |
           git init -q --bare "$RUNNER_TEMP/op.git"
           git --git-dir "$RUNNER_TEMP/op.git" fetch -q --depth 1 https://github.com/fdo2a/fdo2a.github.io \
-            3378e19652bbd5fdfef8281d4b33ad7fe18a4cb5 1b2e0050024159ab55b828d57d19e8c9539a2eab e9ef1a8394b4ae95dd9a7e663f22ac38b68096ff
+            3378e19652bbd5fdfef8281d4b33ad7fe18a4cb5 1b2e0050024159ab55b828d57d19e8c9539a2eab e9ef1a8394b4ae95dd9a7e663f22ac38b68096ff \\
+            7e18f8bc2bdc20d736608414e29b2e07efc42833 3ab3e3f617edc074d63ddc335722506fffd6a28b 68fdf456e1d9574d61f98d4f594f38dfa18bef98 \\
+            4f51fd9bce246793d8e93688e73ebc6abb8dbce5 8bc6e2543befd876881f2294e00abd58ee89c82d c93ea278aac51ce86be0d6d2a7599eeb65f93670 \\
+            61bd4b8c4f1834af2272e1968baecb33ca8f5167 252d765b5ec732247bbb9b6834e95ed494f6e300 bba3fc0ebc0c895e0197694cc74d7799a1e0e96f \\
+            18feaabbbe96bb2f5b51635bc1990bacd75a9b58 73f2d8225a52ab146a04e4578cc53ffaabe95f02
       - name: Fetch the protected data repo (read-only, no credentials)
         run: |
           git clone -q --depth 1 https://github.com/fdo2a/gate-lab-data "$RUNNER_TEMP/data"
