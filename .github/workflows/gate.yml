@@ -41,6 +41,8 @@ jobs:
     needs: judge
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 열쇠는 이 환경의 비밀값이다. 환경은 main 가지에서 도는 실행만 받는다 — 다른 가지에 올린 워크플로는 열쇠를 못 받는다.
+    environment: publish
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
