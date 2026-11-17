@@ -259,7 +259,7 @@ def build_cases(snaps):
     add('P3s', 'us', '사람의 답이 다른 글(다른 해시)에 대한 것이면 쓰이지 않는다', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json', snap=drop('datadir/auctions.json'), review={'datadir/auctions.json': 'not_needed'}, review_other_hash=True)
     add('P4', 'us', '[정상 글] 유동성 자료 없음. 글에 유동성·수급 절은 없지만 다른 절에 「유동성」이 나온다 → 불명확', 'needs_review', note='conditional_evidence_absent:datadir/liquidity/liquidity.json', snap=drop('datadir/liquidity/liquidity.json'))
     add('P5', 'kr', '[정상 글] 특징주 묶음 자료 없음. 글이 「종목 묶음을 싣지 않는다」「은행주 동반 상승」이라고 씀 → 불명확', 'needs_review', note='conditional_evidence_absent:datadir/kr_movers.json', snap=drop('datadir/kr_movers.json'))
-    add('P6', 'us', '[정상 글] 입찰 자료 없음, 글에서 입찰과 닿는 낱말을 모두 지움 → 관련 분석이 없는 선택 자료로 자동 통과', 'publish', note='no_related_content:datadir/auctions.json', snap=drop('datadir/auctions.json'),
+    add('P6', 'us', '[정상 글] 입찰 자료 없음, 글에서 입찰과 닿는 낱말을 모두 지움 → 그래도 자동 통과하지 않는다(조건부 자료는 늘 사람 확인)', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json', snap=drop('datadir/auctions.json'),
         post=lambda p: strip_related(p, 'us', 'datadir/auctions.json'))
     # 1. 입력 누락
     add('M1', 'us', '시세 자료(market_data) 없음', 'hold', 'required_input_missing:datadir/market_data.json', snap=drop('datadir/market_data.json'))
@@ -278,11 +278,13 @@ def build_cases(snaps):
     add('M4k', 'kr', '[반례4] 묶음 표식 없이 문장으로만 「묶음이 6.4% 내렸다」를 쓰고 묶음 자료 없음', 'needs_review', note='conditional_evidence_absent:datadir/kr_movers.json',
         snap=drop('datadir/kr_movers.json'), post=lambda p: insert_before_section_end(p, '특징주', MOVER_PROSE))
     # 여전히 열린 문제 — 자동 차단이 입증되지 않은 것(보류돼야 하는데 발행된다)
-    add('O1', 'us', '[열린 문제] 입찰 자료는 있음. 숫자 없이 「이날 30년물 입찰은 수요가 약했다」고만 씀(그날 입찰은 없었다)', 'hold', known_open=True,
+    add('M4x', 'us', '[남는 위험] 반례1에 사람이 「필요 없다」고 잘못 답하면 발행된다 — 기계가 막지 못한다(보류돼야 함)', 'hold', known_open=True,
+        snap=drop('datadir/auctions.json'), post=lambda p: insert_before_section_end(p, '채권', AUCTION_PROSE), review={'datadir/auctions.json': 'not_needed'})
+    add('O1', 'us', '[열린 문제·문장 검증 공백] 입찰 자료는 있음. 숫자 없이 「이날 30년물 입찰은 수요가 약했다」고만 씀(그날 입찰은 없었다)', 'hold', known_open=True,
         post=lambda p: insert_before_section_end(p, '채권', '<p>이날 30년물 입찰은 수요가 약했다.</p>'))
-    add('O2', 'us', '[열린 문제] 입찰 자료 없음. 닿는 낱말을 모두 피해 「새로 나온 30년 만기 물량은 주문이 2.36배에 그쳤다」고 씀', 'hold', known_open=True,
+    add('M4v', 'us', '[반례1의 변형] 입찰 자료 없음. 닿는 낱말을 모두 피해 「새로 나온 30년 만기 물량은 주문이 2.36배에 그쳤다」고 씀 → 낱말과 무관하게 사람 확인', 'needs_review', note='conditional_evidence_absent:datadir/auctions.json',
         snap=drop('datadir/auctions.json'), post=lambda p: insert_before_section_end(strip_related(p, 'us', 'datadir/auctions.json'), '채권', '<p>새로 나온 30년 만기 물량은 주문이 2.36배에 그쳤다.</p>'))
-    add('O3', 'us', '[열린 문제] 입찰 자료는 있음. 그 자료의 숫자 하나만 문장에 씀(「30년물은 5.441%에 정해졌다」)', 'hold', known_open=True,
+    add('O3', 'us', '[열린 문제·문장 검증 공백] 입찰 자료는 있음. 그 자료의 숫자 하나만 문장에 씀(「30년물은 5.441%에 정해졌다」)', 'hold', known_open=True,
         post=lambda p: insert_before_section_end(p, '채권', '<p>새로 나온 30년물은 5.441%에 정해졌다.</p>'))
     add('M5', 'us', '장중 자료 없음, 글이 장중 흐름을 씀(어느 검사기도 이 자료를 안 본다)', 'hold', 'required_input_missing:datadir/intraday.json', snap=drop('datadir/intraday.json'))
     add('M6', 'kr', '시세 자료(kr_market_data) 없음', 'hold', 'required_input_missing:datadir/kr_market_data.json', snap=drop('datadir/kr_market_data.json'))
@@ -558,7 +560,8 @@ def main():
         for m in ('us', 'kr'):
             x = [r for r in sv if r['market'] == m]
             lines.append('')
-            lines.append('%s: 하나씩 뺀 %d가지 중 발행 %d · 보류 %d' % (m, len(x), sum(r['decision'] == 'publish' for r in x), sum(r['decision'] != 'publish' for r in x)))
+            lines.append('%s: 하나씩 뺀 %d가지 중 발행 %d · 사람 확인 %d · 보류 %d' % (m, len(x), sum(r['decision'] == 'publish' for r in x),
+                         sum(r['decision'] == 'needs_review' for r in x), sum(r['decision'] == 'hold' for r in x)))
     if real:
         lines += ['', '실제 발행 글(운영 저장소 발행 커밋 그대로) — 정상 글이 막히는가', '', '| 시장 | 날짜 | 판정 | 이유·기록 |', '|---|---|---|---|']
         for r in real:

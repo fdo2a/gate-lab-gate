@@ -441,10 +441,9 @@ def judge(market, date, post_bytes, submit, snap_root, work, cycle, prev=None, p
         visible = plain(TAG.sub(' ', post_text or ''))
         for path in absent_cond:
             d = mine.get(path)
-            if related.get(path) and not re.search(related[path], visible, re.I):
-                # 그 자료와 닿는 낱말이 글에 하나도 없다 — 「선택 자료가 없고 관련 분석도 없음」으로 보고 자동 통과
-                v['notes'].append('no_related_content:' + path)
-            elif d == 'not_needed':
+            # 「닿는 낱말이 글에 없으면 자동 통과」는 두지 않는다 — 낱말을 피한 주장이 그대로 나가고(시험 O2),
+            # 실제 글 12편에서 그 경로는 한 번도 쓰이지 않았다. 조건부 자료가 빠진 날은 늘 사람이 본다.
+            if d == 'not_needed':
                 v['notes'].append('human_confirmed_not_needed:' + path)
             elif d == 'needed':
                 v['reasons'].append('claim_without_evidence:' + path)
